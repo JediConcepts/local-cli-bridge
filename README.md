@@ -88,7 +88,7 @@ npm run bridge
 BRIDGE_BACKEND=codex npm run bridge
 
 # BOTH from one bridge on one port, dispatched by requested model id
-BRIDGE_BACKEND=auto BRIDGE_MODELS="opus,sonnet,haiku,gpt-5.5" npm run bridge
+BRIDGE_BACKEND=auto BRIDGE_MODELS="sonnet,sonnet:xhigh,opus,haiku,gpt-5.6-sol,gpt-5.6-sol:high,gpt-5.6-terra,gpt-5.6-luna:low,gpt-5.5" npm run bridge
 
 # Any other CLI that reads a prompt on stdin and prints the answer
 BRIDGE_BACKEND=command BRIDGE_COMMAND='ollama run {model}' npm run bridge
@@ -110,7 +110,7 @@ and values are never logged. Copy [`.env.example`](./.env.example) to `.env.brid
 ```bash
 # .env.bridge.local
 BRIDGE_BACKEND=auto
-BRIDGE_MODELS=opus,sonnet,haiku,gpt-5.5
+BRIDGE_MODELS="sonnet,sonnet:xhigh,opus,haiku,gpt-5.6-sol,gpt-5.6-sol:high,gpt-5.6-terra,gpt-5.6-luna:low,gpt-5.5"
 BRIDGE_API_KEY=<a-strong-random-key>     # if set, callers must send Authorization: Bearer <it>
 ```
 
