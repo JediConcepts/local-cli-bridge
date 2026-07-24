@@ -1,0 +1,37 @@
+# CI for local-cli-bridge. Zero dependencies, so no install step: syntax
+# check all three scripts, then run the node:test smoke suite (which boots
+# the bridge with the `command` backend, no external CLI required).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["18", "20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Syntax check
+        run: |
+          node --check scripts/local-cli-bridge.mjs
+          node --check scripts/bridge-tunnel.mjs
+          node --check scripts/lib/load-bridge-env.mjs
+
+      - name: Smoke tests
+        run: npm test

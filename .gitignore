@@ -1,0 +1,7 @@
+# Local bridge config holds the Bearer key — never commit it.
+.env
+.env.*
+!.env.example
+
+node_modules/
+.DS_Store
