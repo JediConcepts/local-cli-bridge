@@ -27,5 +27,14 @@
     "codex",
     "cli",
     "cloudflare-tunnel"
+  ],
+  "bin": {
+    "local-cli-bridge": "scripts/local-cli-bridge.mjs",
+    "local-cli-bridge-tunnel": "scripts/bridge-tunnel.mjs"
+  },
+  "files": [
+    "scripts",
+    "docs",
+    ".env.example"
   ]
 }
