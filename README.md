@@ -2,6 +2,14 @@
 
 [![CI](https://github.com/JediConcepts/local-cli-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/JediConcepts/local-cli-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/local-cli-bridge)](https://www.npmjs.com/package/local-cli-bridge)
+
+## Quickest start
+
+```sh
+npx local-cli-bridge   # an OpenAI compatible endpoint in front of your local CLI login
+```
+
 
 
 An OpenAI-compatible HTTP shim in front of local coding-agent CLIs (`claude`, `codex`) or
