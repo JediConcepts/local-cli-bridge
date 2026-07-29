@@ -1,5 +1,8 @@
 # Local model bridge (`scripts/local-cli-bridge.mjs`)
 
+> Installed from npm rather than a clone? Wherever this guide says `npm run bridge` or `npm run bridge:tunnel`, use `npx local-cli-bridge` or `npx local-cli-bridge-tunnel`.
+
+
 Route a request from your application to a model running on your own machine.
 
 ## When you need it

@@ -7,8 +7,19 @@
 ## Quickest start
 
 ```sh
-npx local-cli-bridge   # an OpenAI compatible endpoint in front of your local CLI login
+npx local-cli-bridge          # an OpenAI compatible endpoint in front of your local CLI login
 ```
+
+To expose it to a remote application through a named Cloudflare tunnel (one time setup in [docs/REMOTE_BRIDGE.md](./docs/REMOTE_BRIDGE.md)):
+
+```sh
+BRIDGE_TUNNEL_NAME=my-bridge \
+BRIDGE_TUNNEL_CONFIG=~/.cloudflared/my-bridge.yml \
+BRIDGE_API_KEY='a strong random key' \
+npx local-cli-bridge-tunnel
+```
+
+Working from a clone instead of npm? `npm run bridge` and `npm run bridge:tunnel` are the same two entry points.
 
 
 

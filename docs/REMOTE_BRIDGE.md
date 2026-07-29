@@ -1,5 +1,8 @@
 # Remote model bridge over Cloudflare
 
+> Installed from npm rather than a clone? Wherever this guide says `npm run bridge` or `npm run bridge:tunnel`, use `npx local-cli-bridge` or `npx local-cli-bridge-tunnel`.
+
+
 Expose the [local model bridge](./LOCAL_BRIDGE.md) to a **remote** instance of your
 application so it can route a request to a Claude/Codex subscription running on your
 workstation, without opening a port on your machine. Throughout this guide,
