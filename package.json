@@ -1,6 +1,6 @@
 {
   "name": "local-cli-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A minimal, self hosted OpenAI compatible adapter for one shot completions through locally authenticated CLI model tools. A development and testing bridge, not a hosted model service.",
   "license": "MIT",
   "type": "module",

@@ -630,6 +630,21 @@ const server = http.createServer((req, res) => {
   send(res, 404, { error: { message: `No route for ${req.method} ${url}` } });
 });
 
+// Friendly startup failures: EADDRINUSE is the most common first run collision
+// (something else, often another bridge, already owns the port).
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`[bridge] port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
+    console.error(`[bridge] pick another port:  PORT=8790 npx local-cli-bridge`);
+    process.exit(1);
+  }
+  if (err.code === "EACCES") {
+    console.error(`[bridge] no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
+    process.exit(1);
+  }
+  throw err;
+});
+
 server.listen(PORT, HOST, () => {
   console.log(`[bridge] local-cli-bridge listening on http://${HOST}:${PORT}`);
   console.log(`[bridge] backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
