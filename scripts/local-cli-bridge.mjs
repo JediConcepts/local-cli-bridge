@@ -344,7 +344,40 @@ function resolveBackendName(model) {
   return process.env.BRIDGE_AUTO_DEFAULT || "claude"; // ambiguous id → default family
 }
 
-function runBackend({ model, system, prompt }) {
+// Typed bridge failure. `code` classifies the condition (BACKEND_TIMEOUT,
+// BACKEND_FAILED, SPAWN_FAILURE, PARSE_FAILURE, CLIENT_DISCONNECTED, ...) and
+// `safeToExpose` marks messages that reveal nothing about the host (no paths,
+// executables, or login state) and are actionable for remote callers even with
+// error redaction on.
+class BridgeError extends Error {
+  constructor(message, { code, safeToExpose = false } = {}) {
+    super(message);
+    this.name = "BridgeError";
+    this.code = code;
+    this.safeToExpose = safeToExpose;
+  }
+}
+
+// SIGTERM → SIGKILL grace: long enough for a CLI to flush and clean up, short
+// enough that cancellation pressure doesn't pile up dying children.
+const KILL_GRACE_MS = 2_000;
+
+// Best-effort child termination: SIGTERM first (lets the CLI clean up), SIGKILL
+// after a short grace if it ignored the signal. This signals the DIRECT child
+// only — subprocesses the CLI spawned itself may survive on some platforms
+// (no process-group management), and Windows signal semantics differ, so
+// cancellation is best effort, not a guarantee.
+function killChildGracefully(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return; // already gone
+  try { child.kill("SIGTERM"); } catch { /* already gone */ }
+  const hardKill = setTimeout(() => {
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
+  }, KILL_GRACE_MS);
+  hardKill.unref();
+  child.once("close", () => clearTimeout(hardKill));
+}
+
+function runBackend({ model, system, prompt }, { signal } = {}) {
   const backendName = resolveBackendName(model);
   const backend = BACKENDS[backendName];
   if (!backend) throw new Error(`Unknown backend "${backendName}" (claude | codex | command | auto)`);
@@ -357,23 +390,49 @@ function runBackend({ model, system, prompt }) {
   }
 
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new BridgeError("client disconnected before the CLI started", { code: "CLIENT_DISCONNECTED" }));
+    }
     // Neutral cwd so the CLI doesn't load the current project's config files.
     const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: childEnv, cwd: os.tmpdir() });
     let out = "";
     let err = "";
+    // The promise settles ONLY when the child closes (or fails to spawn), never
+    // at the moment of a timeout or client abort: the caller's finally-block
+    // releases the concurrency slot on settlement, so MAX_CONCURRENT stays a
+    // true ceiling on live child processes even while a kill is in flight.
+    let fate = null; // null | "timeout" | "aborted"
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`CLI timed out after ${TIMEOUT_MS}ms`));
+      fate = "timeout";
+      killChildGracefully(child);
     }, TIMEOUT_MS);
+    const onAbort = () => {
+      if (fate) return;
+      fate = "aborted";
+      killChildGracefully(child);
+    };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
 
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     child.on("error", (e) => {
-      clearTimeout(timer);
-      reject(new Error(`Failed to spawn "${cmd}": ${e.message}`));
+      cleanup();
+      reject(new BridgeError(`Failed to spawn "${cmd}": ${e.message}`, { code: "SPAWN_FAILURE" }));
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      cleanup();
+      if (fate) {
+        if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
+        return reject(
+          fate === "timeout"
+            ? new BridgeError(`CLI timed out after ${TIMEOUT_MS}ms`, { code: "BACKEND_TIMEOUT", safeToExpose: true })
+            : new BridgeError("client disconnected before the CLI finished", { code: "CLIENT_DISCONNECTED" }),
+        );
+      }
       if (code !== 0) {
         // Surface the most useful reason. Prefer a structured stdout error (Claude Code's
         // {"is_error":true,"result":"Not logged in…"}); otherwise pick the stderr line that
@@ -390,7 +449,7 @@ function runBackend({ model, system, prompt }) {
           reason = lines.find((l) => /error|failed|not logged|unauthor|invalid|denied|panic/i.test(l)) || lines[0] || "unknown error";
         }
         if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
-        return reject(new Error(`${cmd} failed (exit ${code}): ${reason.slice(0, 400)}`));
+        return reject(new BridgeError(`${cmd} failed (exit ${code}): ${reason.slice(0, 400)}`, { code: "BACKEND_FAILED" }));
       }
       try {
         // Backends that write their answer to a file (Codex --output-last-message) are
@@ -405,11 +464,14 @@ function runBackend({ model, system, prompt }) {
         }
         resolve(backend.parse(payload, { system, prompt }));
       } catch (e) {
-        reject(new Error(`Failed to parse ${cmd} output: ${e.message}\n${out.slice(0, 500)}`));
+        reject(new BridgeError(`Failed to parse ${cmd} output: ${e.message}\n${out.slice(0, 500)}`, { code: "PARSE_FAILURE" }));
       }
     });
 
     if (stdin != null) {
+      // A killed child can EPIPE the write; without a handler that stream error
+      // would crash the whole bridge process.
+      child.stdin.on("error", () => {});
       child.stdin.write(stdin);
       child.stdin.end();
     }
@@ -606,18 +668,32 @@ function handleRequest(req, res) {
         res.write("\n");
       }
       const beat = KEEPALIVE_MS > 0
-        ? setInterval(() => { if (!res.writableEnded) res.write("\n"); }, KEEPALIVE_MS)
+        ? setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, KEEPALIVE_MS)
         : null;
-      res.on("close", () => { if (beat) clearInterval(beat); });
-      const finish = (status, obj) => {
+      let settled = false;
+      // A response 'close' before finish() means the CLIENT went away mid-flight
+      // (it also fires after a normal end, hence the settled guard): abort the
+      // backend so the workstation isn't burning a CLI run nobody will read.
+      // The concurrency slot is NOT released here — runBackend only settles once
+      // the child has actually closed, so the slot keeps counting the dying child.
+      const ac = new AbortController();
+      res.on("close", () => {
         if (beat) clearInterval(beat);
-        if (res.writableEnded) return;
+        if (!settled) ac.abort();
+      });
+      const finish = (status, obj) => {
+        settled = true;
+        if (beat) clearInterval(beat);
+        if (res.writableEnded || res.destroyed) return;
         if (KEEPALIVE_MS > 0) return res.end(JSON.stringify(obj)); // headers already sent
         return send(res, status, obj);
       };
 
       try {
-        const { text, promptTokens, completionTokens } = await runBackend({ model: body.model, system, prompt });
+        const { text, promptTokens, completionTokens } = await runBackend(
+          { model: body.model, system, prompt },
+          { signal: ac.signal },
+        );
         console.log(
           `[bridge] ${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""} → ${text.length} chars in ${Date.now() - t0}ms`,
         );
@@ -631,14 +707,27 @@ function handleRequest(req, res) {
           }),
         );
       } catch (e) {
+        if (e.code === "CLIENT_DISCONNECTED") {
+          // The socket is gone, there is nobody to answer; just record it.
+          console.log(`[bridge] client disconnected after ${Date.now() - t0}ms, ${resolveBackendName(body.model)} child terminated`);
+          return;
+        }
         // Full detail always lands in the SERVER log with a correlation id; whether the
         // CLIENT sees the raw message is governed by BRIDGE_EXPOSE_ERROR_DETAILS (raw
-        // messages can reveal executable names, paths, and login state, redacted by default).
+        // messages can reveal executable names, paths, and login state, redacted by
+        // default) — except BridgeErrors marked safeToExpose, which reveal nothing
+        // about the host and stay actionable for remote callers.
         const errorId = crypto.randomUUID();
         console.error(`[bridge] error ${errorId}: ${e.stack || e.message}`);
-        const message = EXPOSE_ERROR_DETAILS ? e.message : "The local model backend failed";
-        return finish(502, { error: { message, type: "bridge_backend_error", id: errorId } });
+        const message = EXPOSE_ERROR_DETAILS || e.safeToExpose ? e.message : "The local model backend failed";
+        // A timed-out backend is a gateway timeout; every other backend failure
+        // (spawn, non-zero exit, parse) is a bad gateway. With the keepalive
+        // heartbeat active the status is already spent and this arrives in-body.
+        const status = e.code === "BACKEND_TIMEOUT" ? 504 : 502;
+        return finish(status, { error: { message, type: "bridge_backend_error", id: errorId } });
       } finally {
+        // Settlement-scoped release: runBackend settles only after its child
+        // closed, so this can never let a new spawn overlap a dying child.
         activeCompletions -= 1;
       }
     });
@@ -655,7 +744,7 @@ function createBridgeServer() {
 
 // Pure pieces exported for unit tests; importing this module never starts a
 // server or registers signal handlers (see the is-main guard below).
-export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer };
+export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer, BridgeError };
 
 const IS_MAIN = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 
