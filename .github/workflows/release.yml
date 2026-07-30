@@ -1,0 +1,53 @@
+# Publishes to npm with provenance when a version tag is pushed.
+#
+# Inert until the owner configures auth on npmjs.com — preferred: npm Trusted
+# Publishing (Settings → Publishing access) pointing at this repo + workflow,
+# which needs no long-lived secret; the OIDC id-token below is enough.
+# Alternative: add an NPM_TOKEN repo secret and uncomment NODE_AUTH_TOKEN.
+#
+# Publishing is intentionally tag-gated and manual: run through
+# docs/RELEASE_CHECKLIST.md (including the real-CLI gate) before tagging.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # npm --provenance attests the build via OIDC
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Syntax check
+        run: |
+          node --check scripts/local-cli-bridge.mjs
+          node --check scripts/bridge-tunnel.mjs
+          node --check scripts/lib/load-bridge-env.mjs
+          node --check scripts/lib/parse-argv.mjs
+
+      - name: Tests
+        run: npm test
+
+      - name: Tag matches package version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Publish with provenance
+        run: npm publish --provenance --access public
+        # env:
+        #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # only if not using Trusted Publishing
