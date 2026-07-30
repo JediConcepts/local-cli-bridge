@@ -121,6 +121,52 @@ test("n > 1 is a 400 (the bridge returns exactly one choice)", async () => {
   assert.equal(res.status, 400);
 });
 
+test('stream: "true" (a truthy non-boolean) is rejected, not silently buffered', async () => {
+  const res = await completion({ model: "echo-1", stream: "true", messages: [{ role: "user", content: "hi" }] });
+  assert.equal(res.status, 400);
+});
+
+test("explicit nulls from SDK serializers are treated as absent, not rejected", async () => {
+  const res = await completion({
+    model: "echo-1",
+    stream: null,
+    tools: null,
+    tool_choice: null,
+    response_format: null,
+    functions: null,
+    n: null,
+    messages: [{ role: "user", content: "null-tolerant" }],
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.ok(body.choices[0].message.content.includes("null-tolerant"));
+});
+
+test("stream: false is accepted", async () => {
+  const res = await completion({ model: "echo-1", stream: false, messages: [{ role: "user", content: "hi" }] });
+  assert.equal(res.status, 200);
+});
+
+test("an unknown message role is a 400, not silent prompt text", async () => {
+  const res = await completion({ model: "echo-1", messages: [{ role: "robot", content: "hi" }] });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.ok(body.error.message.includes("role"));
+});
+
+test("a message with no role at all is a 400", async () => {
+  const res = await completion({ model: "echo-1", messages: [{ content: "hi" }] });
+  assert.equal(res.status, 400);
+});
+
+test("developer role is accepted (folded as system-level instructions)", async () => {
+  const res = await completion({
+    model: "echo-1",
+    messages: [{ role: "developer", content: "be terse" }, { role: "user", content: "hi" }],
+  });
+  assert.equal(res.status, 200);
+});
+
 test("unknown routes are a 404", async () => {
   const res = await fetch(`${BASE}/v1/nope`);
   assert.equal(res.status, 404);
