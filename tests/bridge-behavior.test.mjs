@@ -55,6 +55,43 @@ test("a backend that outlives BRIDGE_TIMEOUT_MS is killed and reported as a gate
   }
 });
 
+test("BRIDGE_COMMAND quoting: a quoted argument with spaces survives, {model} substitutes everywhere", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand('echo --prefix "quoted prefix {model}+{model}: "'),
+    BRIDGE_API_KEY: KEY,
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody("payload") });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(
+      body.choices[0].message.content.startsWith("quoted prefix test-model+test-model: "),
+      `quoting/substitution mangled: ${body.choices[0].message.content.slice(0, 80)}`,
+    );
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("BRIDGE_COMMAND_JSON: the JSON array form is used verbatim and wins over BRIDGE_COMMAND", async () => {
+  const { FAKE_CLI } = await import("./helpers.mjs");
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: "this-command-does-not-exist",
+    BRIDGE_COMMAND_JSON: JSON.stringify([process.execPath, FAKE_CLI, "echo", "--prefix", "json wins: "]),
+    BRIDGE_API_KEY: KEY,
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody("payload") });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(body.choices[0].message.content.startsWith("json wins: "));
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("a backend that exits non-zero is a 502 with a redacted message by default", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
