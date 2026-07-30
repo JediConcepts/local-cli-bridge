@@ -62,10 +62,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
 import { argsFromEnv } from "./lib/parse-argv.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Pull BRIDGE_* config from .env.bridge.local / .env.local (allowlisted) before reading it,
 // so the command can be run bare. Inline env still wins.
@@ -141,32 +143,34 @@ const ADVERTISED_MODELS = (process.env.BRIDGE_MODELS || DEFAULT_MODELS_BY_BACKEN
   .map((s) => s.trim())
   .filter(Boolean);
 
-// The bridge is the AUTHORITY on local model capabilities (context + output), but
-// neither the Claude Code CLI nor the Codex CLI exposes a machine-readable per-model
-// capability endpoint, so NONE of these values are ever "discovered" from the CLI. They
-// are configured DEFAULTS (a known-model assumption) or operator OVERRIDES. Every
-// /v1/models entry is stamped with `caps_source` so a consumer can tell an assumption
-// from a confirmed value and never presents a family default as though the CLI reported it:
-//   "override", operator-set via BRIDGE_MODEL_CAPS (authoritative for this deployment)
-//   "default" , a family fallback below (a documented per-family API limit, NOT discovered)
-//   "unknown" , no family matched; conservative floor
-// Output ceilings track each model's real API max_tokens: Opus 4.x caps at 32k,
-// Sonnet/Haiku 4.x reach 64k. GPT-5.x figures follow the official OpenAI model catalog
-// (developers.openai.com/api/docs/models, checked 2026-07-21): the 5.6 family and
-// 5.4/5.4-pro are 1,050,000 context; 5.5 ≈ 1,000,000; 5.4-mini/nano and bare gpt-5 are
-// 400,000, all with 128,000 max output. NOTE the context window is SHARED by prompt +
-// reasoning + output, so 1M in AND 128k out in one request is not generally achievable.
-// First matching row wins (order specific → generic). Override per model with
-// BRIDGE_MODEL_CAPS="gpt-5.5=1000000:128000,opus=200000:32000".
-const MODEL_CAPS_DEFAULTS = [
-  [/\bopus\b/i,                  200000, 32000], // Opus 4.x API output ceiling is 32k, not 64k
-  [/\b(sonnet|haiku)\b|claude/i, 200000, 64000],
-  [/gpt-?5\.6/i,                1050000, 128000], // sol / terra / luna
-  [/gpt-?5\.5/i,                1000000, 128000],
-  [/gpt-?5\.4-(mini|nano)/i,     400000, 128000],
-  [/gpt-?5\.4/i,                1050000, 128000], // incl. -pro
-  [/gpt-?5\b|codex/i,            400000, 128000], // bare gpt-5 / unknown Codex slugs, conservative
-];
+// Model capabilities (context + output) are the bridge's CONFIGURED ASSUMPTIONS,
+// never discovered values: neither the Claude Code CLI nor the Codex CLI exposes a
+// machine-readable per-model capability endpoint. Known-family defaults live in
+// config/model-capability-defaults.json (resolved relative to this module, so the
+// npm-installed binary finds it from any cwd); operators override per deployment
+// with BRIDGE_MODEL_CAPS="gpt-5.5=1000000:128000,opus=200000:32000". Every
+// /v1/models entry is stamped with `caps_source` so a consumer can tell what it
+// is getting:
+//   "override", operator-set via BRIDGE_MODEL_CAPS for this deployment
+//   "default" , a family figure from the config file (a documented API limit,
+//               NOT read from any CLI)
+//   "unknown" , no family matched — capability figures are OMITTED entirely
+//               rather than invented, a prompt-sizing consumer must not treat a
+//               made-up floor as meaningful
+// Fail-soft: a missing or corrupt config file logs a warning and every model
+// simply reports "unknown"; a capability table must never stop completions.
+const MODEL_CAPS_DEFAULTS = (() => {
+  const file = path.join(here, "..", "config", "model-capability-defaults.json");
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return (parsed.defaults || []).map((e) => [new RegExp(e.match, "i"), e.context_window, e.max_output_tokens]);
+  } catch (e) {
+    console.warn(`[bridge] could not load model capability defaults (${file}): ${e.message}; models will report caps_source "unknown"`);
+    return [];
+  }
+})();
+// Longest key first: overrides match by substring, so an operator listing both
+// "gpt" and "gpt-5.6" must have the specific entry win for gpt-5.6 models.
 const MODEL_CAPS_OVERRIDES = (process.env.BRIDGE_MODEL_CAPS || "")
   .split(",")
   .map((s) => s.trim())
@@ -176,7 +180,8 @@ const MODEL_CAPS_OVERRIDES = (process.env.BRIDGE_MODEL_CAPS || "")
     const [c, o] = (v || "").split(":").map((n) => Number(n));
     return { key: (k || "").trim().toLowerCase(), context: c, output: o };
   })
-  .filter((x) => x.key);
+  .filter((x) => x.key)
+  .sort((a, b) => b.key.length - a.key.length);
 
 function modelCaps(id) {
   const lower = (id || "").toLowerCase();
@@ -188,7 +193,7 @@ function modelCaps(id) {
   for (const [re, c, o] of MODEL_CAPS_DEFAULTS) {
     if (re.test(id)) return { context_window: c, max_output_tokens: o, caps_source: "default" };
   }
-  return { context_window: 128000, max_output_tokens: 8192, caps_source: "unknown" }; // conservative floor
+  return { caps_source: "unknown" }; // no figures: omitting beats inventing
 }
 const REQUIRE_KEY = process.env.BRIDGE_API_KEY || "";
 
@@ -711,8 +716,9 @@ function handleRequest(req, res) {
     const ids = ADVERTISED_MODELS.length ? ADVERTISED_MODELS : (DEFAULT_MODEL ? [DEFAULT_MODEL] : []);
     return send(res, 200, {
       object: "list",
-      // context_window / max_output_tokens make the bridge authoritative for consumers
-      // that size prompts from discovery.
+      // context_window / max_output_tokens report the bridge's CONFIGURED
+      // ASSUMPTIONS (caps_source tells a consumer which kind); unknown models
+      // carry no figures at all.
       data: ids.map((id) => ({ id, object: "model", owned_by: BACKEND, ...modelCaps(id) })),
     });
   }

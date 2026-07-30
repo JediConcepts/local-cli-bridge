@@ -1,0 +1,12 @@
+{
+  "$comment": "Capability DEFAULTS the bridge advertises on /v1/models for known model families. These are configured assumptions, NOT discovered values — neither the Claude Code CLI nor the Codex CLI exposes a machine-readable per-model capability endpoint, so nothing here is ever read from a CLI. Rows are tried in order, first matching regex (case-insensitive) wins: keep specific patterns above generic ones. Figures checked against the provider catalogs 2026-07-21 (Anthropic: Opus 4.x output caps at 32k, Sonnet/Haiku 4.x reach 64k; OpenAI: developers.openai.com/api/docs/models). Context windows are SHARED by prompt + reasoning + output. Models matching no row report caps_source \"unknown\" with no invented figures. Per-deployment overrides: BRIDGE_MODEL_CAPS.",
+  "defaults": [
+    { "match": "\\bopus\\b", "context_window": 200000, "max_output_tokens": 32000, "note": "Opus 4.x API output ceiling is 32k, not 64k" },
+    { "match": "\\b(sonnet|haiku)\\b|claude", "context_window": 200000, "max_output_tokens": 64000 },
+    { "match": "gpt-?5\\.6", "context_window": 1050000, "max_output_tokens": 128000, "note": "sol / terra / luna" },
+    { "match": "gpt-?5\\.5", "context_window": 1000000, "max_output_tokens": 128000 },
+    { "match": "gpt-?5\\.4-(mini|nano)", "context_window": 400000, "max_output_tokens": 128000 },
+    { "match": "gpt-?5\\.4", "context_window": 1050000, "max_output_tokens": 128000, "note": "incl. -pro" },
+    { "match": "gpt-?5\\b|codex", "context_window": 400000, "max_output_tokens": 128000, "note": "bare gpt-5 / unknown Codex slugs, conservative" }
+  ]
+}
