@@ -23,9 +23,11 @@
  * Env:
  *   PORT               (default 8787)
  *   HOST               (default 127.0.0.1, loopback; set 0.0.0.0 only if you must)
- *   BRIDGE_BACKEND     claude | codex | command
- *   BRIDGE_COMMAND     for backend=command: a shell-word template; {model} is substituted,
- *                      the system+prompt text is written to the process stdin
+ *   BRIDGE_BACKEND     claude | codex | command | auto
+ *   BRIDGE_COMMAND     for backend=command: a quoted command template ({model} is
+ *                      substituted, the system+prompt text is written to the process
+ *                      stdin). Quoting supported via lib/parse-argv.mjs — no shell.
+ *                      BRIDGE_COMMAND_JSON (a JSON array of strings) is the exact form.
  *   BRIDGE_MODEL       default model id when a request omits one
  *   BRIDGE_TIMEOUT_MS  per-request CLI timeout (default 900000 = 15m; long-running
  *                      pipeline stages can take minutes)
@@ -35,7 +37,9 @@
  *                      heuristic), local requests keep real status codes. 0 never,
  *                      N ms always. See "Cloudflare 524" note on the completions handler.
  *   BRIDGE_MAX_BODY_BYTES    request body ceiling (default 10485760 = 10MB, the CLI stdin cap)
- *   BRIDGE_MAX_CONCURRENT    max simultaneous CLI completions (default 4; excess → 429)
+ *   BRIDGE_MAX_PROCESS_OUTPUT_BYTES  ceiling on total child output, stdout+stderr+result
+ *                      file (default 10485760 = 10MB; breach kills the child → 502)
+ *   BRIDGE_MAX_CONCURRENT    ceiling on live CLI child processes (default 4; excess → 429)
  *   BRIDGE_EXPOSE_ERROR_DETAILS  0 (default) returns a generic message + correlation id
  *                      to the client, full details stay in the server log. Set 1
  *                      explicitly to return raw backend error messages ("Not logged
