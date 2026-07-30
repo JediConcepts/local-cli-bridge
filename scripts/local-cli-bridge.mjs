@@ -277,9 +277,11 @@ const BACKENDS = {
    * the runner reads back, so agent chatter on stdout never pollutes the completion.
    * read-only sandbox means it can't modify the filesystem. Codex uses its own
    * ~/.codex/auth.json login (the child env has API keys stripped, see runBackend).
+   * `codex exec` has no system-prompt flag, so system text is prepended to the
+   * piped prompt (same shape as the command backend) rather than dropped.
    */
   codex: {
-    build({ model, prompt }) {
+    build({ model, system, prompt }) {
       const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${Date.now()}.txt`);
       const args = ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", outFile];
       const { id, effort } = splitModelEffort(model);
@@ -291,7 +293,12 @@ const BACKENDS = {
         text: process.env.BRIDGE_CODEX_ARGS,
         label: "BRIDGE_CODEX_ARGS_JSON",
       });
-      return { cmd: "codex", args: [...args, ...extra], stdin: prompt, resultFile: outFile };
+      return {
+        cmd: "codex",
+        args: [...args, ...extra],
+        stdin: system ? `${system}\n\n${prompt}` : prompt,
+        resultFile: outFile,
+      };
     },
     parse(out) {
       let t = (out || "").trim();
@@ -340,14 +347,29 @@ const BACKENDS = {
 
 // ── OpenAI <-> CLI mapping ──────────────────────────────────────────────────────
 
-/** Flatten OpenAI `messages` into { system, prompt } the CLIs can take. */
+/**
+ * Flatten OpenAI `messages` into { system, prompt } the CLIs can take.
+ * `system` and `developer` messages both join into the system text (modern
+ * OpenAI clients send developer instructions where older ones sent system).
+ * The dominant case — exactly one user turn — passes through byte-identical,
+ * no label, so simple clients get exactly the prompt they sent. Multi-turn
+ * history renders as a labeled transcript (User: / Assistant: / Tool:): the
+ * CLIs are one-shot, so history arrives as readable context, with every turn
+ * labeled symmetrically rather than only the assistant's. No trailing
+ * completion cue is appended — its effect on the real CLIs is unverified.
+ */
+const ROLE_LABELS = { user: "User", assistant: "Assistant", tool: "Tool", function: "Tool" };
 function foldMessages(messages = []) {
-  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
-  const convo = messages
-    .filter((m) => m.role !== "system")
-    .map((m) => (m.role === "assistant" ? `Assistant: ${m.content}` : m.content))
+  const isSystem = (m) => m.role === "system" || m.role === "developer";
+  const system = messages.filter(isSystem).map((m) => m.content ?? "").join("\n\n");
+  const convo = messages.filter((m) => !isSystem(m));
+  if (convo.length === 1 && convo[0].role === "user") {
+    return { system, prompt: convo[0].content ?? "" };
+  }
+  const prompt = convo
+    .map((m) => `${ROLE_LABELS[m.role] || m.role}: ${m.content ?? ""}`)
     .join("\n\n");
-  return { system, prompt: convo };
+  return { system, prompt };
 }
 
 function estimateTokens(str) {
