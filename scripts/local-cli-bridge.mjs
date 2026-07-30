@@ -60,6 +60,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
 
 // Pull BRIDGE_* config from .env.bridge.local / .env.local (allowlisted) before reading it,
@@ -492,7 +493,7 @@ function unsupportedFeature(body) {
   return null;
 }
 
-const server = http.createServer((req, res) => {
+function handleRequest(req, res) {
   const url = (req.url || "").split("?")[0];
 
   // Auth-enforced liveness/readiness probe. Behind Cloudflare Access (edge) AND the
@@ -628,36 +629,51 @@ const server = http.createServer((req, res) => {
   }
 
   send(res, 404, { error: { message: `No route for ${req.method} ${url}` } });
-});
+}
 
-// Friendly startup failures: EADDRINUSE is the most common first run collision
-// (something else, often another bridge, already owns the port).
-server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(`[bridge] port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
-    console.error(`[bridge] pick another port:  PORT=8790 npx local-cli-bridge`);
-    process.exit(1);
-  }
-  if (err.code === "EACCES") {
-    console.error(`[bridge] no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
-    process.exit(1);
-  }
-  throw err;
-});
+/** Build (but do not bind) the bridge's HTTP server. */
+function createBridgeServer() {
+  return http.createServer(handleRequest);
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`[bridge] local-cli-bridge listening on http://${HOST}:${PORT}`);
-  console.log(`[bridge] backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
-  console.log(`[bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
-});
+// Pure pieces exported for unit tests; importing this module never starts a
+// server or registers signal handlers (see the is-main guard below).
+export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer };
 
-// Graceful shutdown: stop accepting connections, let in-flight completions drain
-// (their CLI children are killed by the runner's own timeout at worst).
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => {
-    console.log(`[bridge] ${sig}, shutting down`);
-    server.close(() => process.exit(0));
-    // Hard exit if a long completion holds the server open past a grace period.
-    setTimeout(() => process.exit(0), 5_000).unref();
+const IS_MAIN = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (IS_MAIN) {
+  const server = createBridgeServer();
+
+  // Friendly startup failures: EADDRINUSE is the most common first run collision
+  // (something else, often another bridge, already owns the port).
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[bridge] port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
+      console.error(`[bridge] pick another port:  PORT=8790 npx local-cli-bridge`);
+      process.exit(1);
+    }
+    if (err.code === "EACCES") {
+      console.error(`[bridge] no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
+      process.exit(1);
+    }
+    throw err;
   });
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[bridge] local-cli-bridge listening on http://${HOST}:${PORT}`);
+    console.log(`[bridge] backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
+    console.log(`[bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
+  });
+
+  // Graceful shutdown: stop accepting connections, let in-flight completions drain
+  // (their CLI children are killed by the runner's own timeout at worst).
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => {
+      console.log(`[bridge] ${sig}, shutting down`);
+      server.close(() => process.exit(0));
+      // Hard exit if a long completion holds the server open past a grace period.
+      setTimeout(() => process.exit(0), 5_000).unref();
+    });
+  }
 }

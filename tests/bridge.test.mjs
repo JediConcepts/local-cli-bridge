@@ -4,36 +4,27 @@
 // exercised with zero dependencies.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { startBridge } from "./helpers.mjs";
 
-const PORT = 18000 + Math.floor(Math.random() * 2000);
-const BASE = `http://127.0.0.1:${PORT}`;
 const KEY = "test-key-123";
 
-const child = spawn(process.execPath, ["scripts/local-cli-bridge.mjs"], {
-  env: {
-    ...process.env,
-    PORT: String(PORT),
-    HOST: "127.0.0.1",
-    BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: "cat",
-    BRIDGE_API_KEY: KEY,
-    BRIDGE_KEEPALIVE_MS: "0",
-    BRIDGE_MODELS: "echo-1",
-    BRIDGE_ENV_FILE: "/dev/null",
-  },
-  stdio: ["ignore", "pipe", "pipe"],
+const bridge = await startBridge({
+  BRIDGE_BACKEND: "command",
+  BRIDGE_COMMAND: "cat",
+  BRIDGE_API_KEY: KEY,
+  BRIDGE_MODELS: "echo-1",
 });
+const BASE = bridge.base;
 
-await new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error("bridge did not start within 5s")), 5000);
-  child.stdout.on("data", (d) => {
-    if (String(d).includes("listening")) { clearTimeout(timer); resolve(); }
+after(() => bridge.stop());
+
+function completion(body, headers = { Authorization: `Bearer ${KEY}` }) {
+  return fetch(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
   });
-  child.on("exit", (code) => { clearTimeout(timer); reject(new Error(`bridge exited early (${code})`)); });
-});
-
-after(() => child.kill("SIGKILL"));
+}
 
 test("GET /health from loopback needs no auth and reports the backend", async () => {
   const res = await fetch(`${BASE}/health`);
@@ -55,11 +46,7 @@ test("GET /v1/models advertises models with capability figures and provenance", 
 });
 
 test("POST /v1/chat/completions round trips through the command backend", async () => {
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
-    body: JSON.stringify({ model: "echo-1", messages: [{ role: "user", content: "ping-pong-test" }] }),
-  });
+  const res = await completion({ model: "echo-1", messages: [{ role: "user", content: "ping-pong-test" }] });
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.object, "chat.completion");
@@ -69,30 +56,72 @@ test("POST /v1/chat/completions round trips through the command backend", async 
 });
 
 test("completions with a wrong Bearer key are refused with 401", async () => {
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-key-999" },
-    body: JSON.stringify({ model: "echo-1", messages: [{ role: "user", content: "hi" }] }),
-  });
+  const res = await completion(
+    { model: "echo-1", messages: [{ role: "user", content: "hi" }] },
+    { Authorization: "Bearer wrong-key-999" },
+  );
+  assert.equal(res.status, 401);
+});
+
+test("completions with no Authorization header at all are refused with 401", async () => {
+  const res = await completion({ model: "echo-1", messages: [{ role: "user", content: "hi" }] }, {});
   assert.equal(res.status, 401);
 });
 
 test("invalid JSON body is a 400, not a crash", async () => {
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
-    body: "{not json",
-  });
+  const res = await completion("{not json");
   assert.equal(res.status, 400);
 });
 
-test("unsupported features are rejected loudly: stream true is a 400", async () => {
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
-    body: JSON.stringify({ model: "echo-1", stream: true, messages: [{ role: "user", content: "hi" }] }),
+test("non-array messages is a 400", async () => {
+  const res = await completion({ model: "echo-1", messages: "just a string" });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.ok(body.error.message.includes("array"));
+});
+
+test("a null message entry is a 400", async () => {
+  const res = await completion({ model: "echo-1", messages: [null] });
+  assert.equal(res.status, 400);
+});
+
+test("non-string message content (content blocks) is a 400", async () => {
+  const res = await completion({
+    model: "echo-1",
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
   });
   assert.equal(res.status, 400);
   const body = await res.json();
+  assert.ok(body.error.message.includes("content"));
+});
+
+test("unsupported features are rejected loudly: stream true is a 400", async () => {
+  const res = await completion({ model: "echo-1", stream: true, messages: [{ role: "user", content: "hi" }] });
+  assert.equal(res.status, 400);
+  const body = await res.json();
   assert.ok(body.error.message.includes("stream"));
+});
+
+for (const [field, value] of [
+  ["tools", [{ type: "function", function: { name: "f" } }]],
+  ["tool_choice", "auto"],
+  ["response_format", { type: "json_object" }],
+  ["functions", [{ name: "f" }]],
+]) {
+  test(`unsupported field \`${field}\` is a 400 naming the field`, async () => {
+    const res = await completion({ model: "echo-1", [field]: value, messages: [{ role: "user", content: "hi" }] });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.ok(body.error.message.includes(field));
+  });
+}
+
+test("n > 1 is a 400 (the bridge returns exactly one choice)", async () => {
+  const res = await completion({ model: "echo-1", n: 2, messages: [{ role: "user", content: "hi" }] });
+  assert.equal(res.status, 400);
+});
+
+test("unknown routes are a 404", async () => {
+  const res = await fetch(`${BASE}/v1/nope`);
+  assert.equal(res.status, 404);
 });
