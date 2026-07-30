@@ -62,6 +62,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
+import { argsFromEnv } from "./lib/parse-argv.mjs";
 
 // Pull BRIDGE_* config from .env.bridge.local / .env.local (allowlisted) before reading it,
 // so the command can be run bare. Inline env still wins.
@@ -231,7 +232,11 @@ const BACKENDS = {
       if (modelId) args.push("--model", modelId);
       if (effort && CLAUDE_EFFORTS.has(effort)) args.push("--effort", effort);
       if (system) args.push("--append-system-prompt", system);
-      const extra = (process.env.BRIDGE_CLAUDE_ARGS || "").split(/\s+/).filter(Boolean);
+      const extra = argsFromEnv({
+        json: process.env.BRIDGE_CLAUDE_ARGS_JSON,
+        text: process.env.BRIDGE_CLAUDE_ARGS,
+        label: "BRIDGE_CLAUDE_ARGS_JSON",
+      });
       return { cmd: "claude", args: [...args, ...extra], stdin: prompt };
     },
     parse(out) {
@@ -258,7 +263,11 @@ const BACKENDS = {
       if (id) args.push("--model", id);
       // -c parses its value as TOML, the inner double quotes are required.
       if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
-      const extra = (process.env.BRIDGE_CODEX_ARGS || "").split(/\s+/).filter(Boolean);
+      const extra = argsFromEnv({
+        json: process.env.BRIDGE_CODEX_ARGS_JSON,
+        text: process.env.BRIDGE_CODEX_ARGS,
+        label: "BRIDGE_CODEX_ARGS_JSON",
+      });
       return { cmd: "codex", args: [...args, ...extra], stdin: prompt, resultFile: outFile };
     },
     parse(out) {
@@ -275,17 +284,25 @@ const BACKENDS = {
   },
 
   /**
-   * Universal escape hatch: BRIDGE_COMMAND is a whitespace-separated command whose
-   * `{model}` token is substituted; the combined system+prompt text is piped to stdin
-   * and the process's raw stdout is taken as the completion. Works for any CLI that
-   * reads a prompt on stdin and prints the answer.
+   * Universal escape hatch: BRIDGE_COMMAND is a quoted command template (see
+   * lib/parse-argv.mjs for the exact grammar — quoting supported, NO shell
+   * expansion) whose `{model}` tokens are substituted; the combined system+prompt
+   * text is piped to stdin and the process's raw stdout is taken as the completion.
+   * Works for any CLI that reads a prompt on stdin and prints the answer.
    *   BRIDGE_BACKEND=command BRIDGE_COMMAND='ollama run {model}'
+   * BRIDGE_COMMAND_JSON='["ollama","run","{model}"]' is the exact, quoting-proof form.
    */
   command: {
     build({ model, system, prompt }) {
-      const template = process.env.BRIDGE_COMMAND;
-      if (!template) throw new Error("BRIDGE_COMMAND is required for backend=command");
-      const parts = template.split(/\s+/).filter(Boolean).map((p) => p.replace("{model}", model || ""));
+      if (!process.env.BRIDGE_COMMAND_JSON && !process.env.BRIDGE_COMMAND) {
+        throw new Error("BRIDGE_COMMAND (or BRIDGE_COMMAND_JSON) is required for backend=command");
+      }
+      const parts = argsFromEnv({
+        json: process.env.BRIDGE_COMMAND_JSON,
+        text: process.env.BRIDGE_COMMAND,
+        label: "BRIDGE_COMMAND_JSON",
+      }).map((p) => p.replaceAll("{model}", model || ""));
+      if (!parts.length || !parts[0]) throw new Error("BRIDGE_COMMAND resolved to an empty command");
       return {
         cmd: parts[0],
         args: parts.slice(1),
