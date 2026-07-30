@@ -114,11 +114,15 @@ process.on("SIGTERM", () => shutdown(0));
 console.log(`[bridge:tunnel] starting bridge on 127.0.0.1:${port} (backend=${backend}) + tunnel "${tunnelName}"`);
 
 // 1. Bridge, always loopback, with the advertised models. BRIDGE_API_KEY passes through.
+//    Keepalive defaults to "auto" (not a forced interval): the bridge heartbeats
+//    Cloudflare-forwarded requests to defeat the edge's ~100s 524, while direct
+//    local requests to the same instance keep their real status codes.
 start("bridge", process.execPath, [path.join(here, "local-cli-bridge.mjs")], {
   HOST: "127.0.0.1",
   PORT: port,
   BRIDGE_BACKEND: backend,
   BRIDGE_MODELS: models,
+  BRIDGE_KEEPALIVE_MS: process.env.BRIDGE_KEEPALIVE_MS || "auto",
 });
 
 // 2. Named tunnel, pass --config when given so a dedicated tunnel doesn't collide with an
