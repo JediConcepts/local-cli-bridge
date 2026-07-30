@@ -646,14 +646,21 @@ let activeCompletions = 0;
 
 // OpenAI request features the bridge does NOT implement. Rejecting them loudly beats
 // silently ignoring them, a caller that sets `stream: true` would otherwise wait for
-// SSE that never comes and misread the buffered JSON.
+// SSE that never comes and misread the buffered JSON. An explicit `null` is treated
+// as absent throughout: several OpenAI SDKs serialize unset optionals as null.
 const UNSUPPORTED_FIELDS = ["tools", "tool_choice", "response_format", "functions"];
 function unsupportedFeature(body) {
-  if (body.stream === true) return "stream: true (the bridge returns a single buffered completion)";
-  if (body.n !== undefined && body.n !== 1) return "n > 1";
-  for (const f of UNSUPPORTED_FIELDS) if (body[f] !== undefined) return f;
+  if (body.stream !== undefined && body.stream !== false && body.stream !== null) {
+    return "stream (the bridge returns a single buffered completion)";
+  }
+  if (body.n != null && body.n !== 1) return "n > 1";
+  for (const f of UNSUPPORTED_FIELDS) if (body[f] != null) return f;
   return null;
 }
+
+// The roles the bridge knows how to fold into a CLI prompt. Anything else is
+// rejected rather than silently rendered into prompt text.
+const ALLOWED_ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function"]);
 
 function handleRequest(req, res) {
   const url = (req.url || "").split("?")[0];
@@ -721,6 +728,9 @@ function handleRequest(req, res) {
       }
       if ((body.messages ?? []).some((m) => m == null || (m.content != null && typeof m.content !== "string"))) {
         return send(res, 400, { error: { message: "message content must be a string (content blocks are not supported)" } });
+      }
+      if ((body.messages ?? []).some((m) => !ALLOWED_ROLES.has(m.role))) {
+        return send(res, 400, { error: { message: `message role must be one of: ${[...ALLOWED_ROLES].join(", ")}` } });
       }
       const unsupported = unsupportedFeature(body);
       if (unsupported) {
