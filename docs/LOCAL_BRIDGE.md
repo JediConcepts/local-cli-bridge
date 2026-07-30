@@ -61,45 +61,48 @@ single custom endpoint in your application and pick the model per request. Set
 | `HOST` | `127.0.0.1` | bind address, keep it loopback unless you must expose it |
 | `BRIDGE_BACKEND` | `claude` | `claude` \| `codex` \| `command` \| `auto` (dispatch by model id) |
 | `BRIDGE_AUTO_DEFAULT` | `claude` | `auto` mode: backend for an ambiguous model id |
-| `BRIDGE_COMMAND` |, | `command` backend: a template; `{model}` is substituted, prompt piped to stdin |
+| `BRIDGE_COMMAND` |, | `command` backend: a quoted command template; `{model}` tokens are substituted, prompt piped to stdin. Quoting and backslash escapes are supported (a **limited argv parser** — no shell expansion, no substitution; see `scripts/lib/parse-argv.mjs` for the exact grammar) |
+| `BRIDGE_COMMAND_JSON` |, | `command` backend, exact form: a JSON array of strings (`'["ollama","run","{model}"]'`). Wins over `BRIDGE_COMMAND` when both are set |
 | `BRIDGE_MODEL` |, | default model id when a request omits one |
 | `BRIDGE_MODELS` | claude only | comma-separated ids advertised on `/v1/models` to prefill a routing dropdown (claude default: `opus,sonnet,haiku`). Codex slugs vary per account, so set your own, e.g. `BRIDGE_MODELS="gpt-5.5,gpt-5.6-sol"`, otherwise discovery returns an empty list |
-| `BRIDGE_TIMEOUT_MS` | `900000` | per-request CLI timeout (long-running pipeline stages can take minutes) |
+| `BRIDGE_TIMEOUT_MS` | `900000` | per-request CLI timeout; on expiry the child is killed (SIGTERM, then SIGKILL after 2s) and the request fails `504` |
 | `BRIDGE_API_KEY` |, | if set, callers must send `Authorization: Bearer <it>` |
-| `BRIDGE_KEEPALIVE_MS` | `20000` | whitespace-heartbeat interval for in-flight completions; `0` disables (see [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md) on the Cloudflare 524) |
+| `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat. `auto` heartbeats **only requests carrying Cloudflare edge headers** (a heuristic on `cf-ray` / `cf-connecting-ip` — forgeable, and forging merely turns the heartbeat on for that request), so local calls keep real status codes; `0` never heartbeats, a number heartbeats every N ms for every request (see [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md)) |
 | `BRIDGE_MAX_BODY_BYTES` | `10485760` | request body ceiling (10 MB, the CLI stdin cap); excess → 413 |
-| `BRIDGE_MAX_CONCURRENT` | `4` | max simultaneous CLI completions; excess → 429. Single-user operators can lower it |
+| `BRIDGE_MAX_PROCESS_OUTPUT_BYTES` | `10485760` | ceiling on **total child process output** — stdout + stderr + the Codex result file, agent chatter included, not just the model answer. On breach the child is killed and the request fails `502` |
+| `BRIDGE_MAX_CONCURRENT` | `4` | ceiling on live CLI child processes; excess → 429. Held until a child actually exits — including one that is being killed after its client disconnected — so it can never be exceeded during cancellation. Single-user operators can lower it |
 | `BRIDGE_EXPOSE_ERROR_DETAILS` | `0` | `1` returns raw backend error messages to the client (they can reveal executable names, paths, and login state), set it only on a trusted local deployment; the default returns a generic message + correlation id, with full detail in the server log |
 | `BRIDGE_ALLOW_QUERY_KEY` | `0` | `1` enables `GET /v1/models?key=<BRIDGE_API_KEY>` for browser viewing through the tunnel (key lands in history/logs, opt-in) |
 | `BRIDGE_TRUST_CF_ACCESS` | `0` | `1` lets requests that passed Cloudflare Access (edge-stamped `Cf-Access-Jwt-Assertion`) view GET discovery routes. Only sound while Access covers the hostname |
-| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset |
+| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND` |
+| `BRIDGE_CLAUDE_ARGS_JSON` / `BRIDGE_CODEX_ARGS_JSON` |, | exact form: a JSON array of strings, wins over the plain variable when both are set |
 | `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them) |
 | `BRIDGE_ENV_FILE` |, | explicit env-file path, overriding the auto-load order below |
 | `BRIDGE_MODEL_CAPS` |, | per-model capability overrides: `"gpt-5.5=1000000:128000,opus=200000:32000"` (`<id>=<context>:<maxOutput>`). Overrides win over the family defaults and are reported with `caps_source: "override"` |
 
-### Model capabilities are DEFAULTS, not discovered values
+### Model capabilities are CONFIGURED ASSUMPTIONS, not discovered values
 
 `/v1/models` advertises a `context_window` and `max_output_tokens` per model so a consumer
-that sizes prompts from discovery gets correct figures (this is what stops a GPT-5.x model
-with a real 400k to 1,050k context from being silently under-sized at a conservative 128k
-floor). **Neither the Claude Code CLI nor the Codex CLI exposes a machine-readable
-capability endpoint**, so these numbers are never *discovered from the CLI*, they are
-configured. Each entry is stamped with `caps_source` so a consumer can tell an assumption
-from a confirmed value:
+that sizes prompts from discovery gets sensible figures. **Neither the Claude Code CLI nor
+the Codex CLI exposes a machine-readable capability endpoint**, so these numbers are never
+*discovered from the CLI* — they are the bridge's configured assumptions. Each entry is
+stamped with `caps_source` so a consumer can tell what it is getting:
 
 | `caps_source` | Meaning |
 |---|---|
-| `override` | You set it via `BRIDGE_MODEL_CAPS`, authoritative for this deployment |
-| `default` | A built-in per-family fallback (a documented API limit, **not** discovered) |
-| `unknown` | No family matched, a conservative `128000 : 8192` floor |
+| `override` | You set it via `BRIDGE_MODEL_CAPS` for this deployment |
+| `default` | A per-family figure from [`config/model-capability-defaults.json`](../config/model-capability-defaults.json) (a documented API limit, **not** discovered) |
+| `unknown` | No family matched — `context_window` / `max_output_tokens` are **omitted entirely** rather than invented; fall back to your client's own sizing |
 
-Built-in defaults track each model's documented API limits: **Opus 4.x caps at 32k
-output** (not 64k, it is split out from the Claude family for this reason), Sonnet/Haiku
-4.x reach 64k over a 200k context, and the GPT-5.x family reaches **128k output**,
-over a 1,050,000-token context for the 5.6 family (sol/terra/luna) and 5.4/5.4-pro,
-~1,000,000 for 5.5, and 400,000 for 5.4-mini/nano and bare `gpt-5`. If your
-subscription's usable ceiling differs, set `BRIDGE_MODEL_CAPS` and the value flips to
-`caps_source: "override"`.
+The family defaults ship in `config/model-capability-defaults.json` (with the catalog
+citations and checked-on date in the file), so reviewing or adjusting them is a data-file
+edit, not a code change. Highlights: **Opus 4.x caps at 32k output** (not 64k, it is split
+out from the Claude family for this reason), Sonnet/Haiku 4.x reach 64k over a 200k
+context, and the GPT-5.x family reaches **128k output** over contexts from 400k to
+1,050,000 tokens depending on the model. Model identifiers drift as providers ship new
+families; if a figure looks stale or your subscription's usable ceiling differs, set
+`BRIDGE_MODEL_CAPS` (comma-separated `<substring>=<context>:<maxOutput>` — the longest
+matching substring wins) and the value flips to `caps_source: "override"`.
 
 ### Run it bare, config from a file
 
@@ -143,7 +146,18 @@ This section is authoritative for what the bridge actually runs:
 - **`codex`**, `codex exec --ephemeral --sandbox read-only --output-last-message <tmp>`,
   prompt on stdin. Codex writes only its final message to `<tmp>`, which the bridge reads,
   so agent chatter on stdout never pollutes the answer, and `read-only` blocks filesystem
-  writes.
+  writes. `codex exec` has no system-prompt flag, so system/developer text is **prepended
+  to the piped prompt** rather than dropped.
+
+### Cancellation
+
+When a client disconnects mid-completion, the bridge kills the spawned CLI (SIGTERM, then
+SIGKILL after 2 seconds if ignored) instead of letting it run to completion for nobody.
+The request's concurrency slot is held until the child has actually exited, so
+`BRIDGE_MAX_CONCURRENT` remains a hard ceiling on live child processes even under
+cancellation pressure. Termination is **best effort**: only the direct child is signalled
+— subprocesses the CLI spawned itself may survive on some platforms, and Windows signal
+semantics differ.
 
 ### Reasoning effort, per-request, via a model-id suffix (both backends)
 
