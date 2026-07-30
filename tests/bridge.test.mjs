@@ -78,6 +78,15 @@ test("invalid JSON body is a 400, not a crash", async () => {
   assert.equal(res.status, 400);
 });
 
+test("a non-object JSON body (null, string, array) is a 400, not a crash", async () => {
+  for (const raw of ["null", '"just a string"', "[1,2,3]"]) {
+    const res = await completion(raw);
+    assert.equal(res.status, 400, `body ${raw} must be rejected`);
+  }
+  const after = await completion({ model: "echo-1", messages: [{ role: "user", content: "still alive" }] });
+  assert.equal(after.status, 200, "the server must survive non-object bodies");
+});
+
 test("non-array messages is a 400", async () => {
   const res = await completion({ model: "echo-1", messages: "just a string" });
   assert.equal(res.status, 400);
