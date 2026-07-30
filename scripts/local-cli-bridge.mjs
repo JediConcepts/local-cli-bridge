@@ -883,7 +883,17 @@ function createBridgeServer() {
 // server or registers signal handlers (see the is-main guard below).
 export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer, BridgeError };
 
-const IS_MAIN = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+// realpath matters: npm installs bin entries as SYMLINKS (node_modules/.bin/…),
+// so argv[1] is the link while import.meta.url is the resolved file — without
+// resolving, the installed binary would import as a library and exit silently.
+const IS_MAIN = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+  } catch {
+    return false; // argv[1] not a resolvable path → we were imported, not executed
+  }
+})();
 
 if (IS_MAIN) {
   const server = createBridgeServer();
