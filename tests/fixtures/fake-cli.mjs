@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+// Controllable stand-in for a real CLI backend, driven entirely by argv so the
+// bridge's `command` backend can exercise failure modes no real CLI reproduces
+// on demand (slow runs, runaway output, hangs that ignore SIGTERM).
+//
+//   node fake-cli.mjs [mode] [options]
+//
+// Modes:
+//   echo   (default)  read stdin, write it back to stdout, exit 0
+//   slow              read stdin, wait --ms, then echo, exit 0
+//   chatty            write --bytes of "x" to stdout, exit 0
+//   fail              write --msg to stderr, exit 1
+//   hang              never exit; a SIGTERM writes --marker (if set) and exits 0
+//   hang-hard         never exit; SIGTERM is trapped and IGNORED (writes --marker),
+//                     only SIGKILL ends it — proves the bridge's kill escalation
+// Options:
+//   --ms N        delay for `slow` (default 1000)
+//   --bytes N     stdout size for `chatty` (default 1024)
+//   --msg S       stderr text for `fail` (default "fake-cli failure")
+//   --marker P    file path written when SIGTERM arrives (hang / hang-hard)
+//   --prefix S    text prepended to the echo output (quoting round-trip check)
+
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const mode = argv[0] && !argv[0].startsWith("--") ? argv[0] : "echo";
+const opts = {};
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i].startsWith("--")) opts[argv[i].slice(2)] = argv[i + 1];
+}
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let data = "";
+    process.stdin.on("data", (d) => (data += d));
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", () => resolve(data));
+  });
+}
+
+async function writeBytes(n) {
+  const block = "x".repeat(65536);
+  let left = n;
+  while (left > 0) {
+    const piece = left >= block.length ? block : "x".repeat(left);
+    left -= piece.length;
+    if (!process.stdout.write(piece)) {
+      await new Promise((r) => process.stdout.once("drain", r));
+    }
+  }
+}
+
+if (mode === "hang" || mode === "hang-hard") {
+  process.on("SIGTERM", () => {
+    if (opts.marker) {
+      try { fs.writeFileSync(opts.marker, "sigterm"); } catch { /* best effort */ }
+    }
+    if (mode === "hang") process.exit(0);
+    // hang-hard: swallow the signal and keep running; only SIGKILL ends us.
+  });
+  readStdin(); // drain stdin so the bridge's write never blocks
+  setInterval(() => {}, 60_000); // keep the event loop alive forever
+} else if (mode === "chatty") {
+  await readStdin();
+  await writeBytes(Number(opts.bytes ?? 1024));
+  process.exit(0);
+} else if (mode === "fail") {
+  await readStdin();
+  process.stderr.write(String(opts.msg ?? "fake-cli failure") + "\n");
+  process.exit(1);
+} else {
+  // echo / slow
+  const input = await readStdin();
+  if (mode === "slow") await new Promise((r) => setTimeout(r, Number(opts.ms ?? 1000)));
+  process.stdout.write((opts.prefix ?? "") + input);
+  process.exit(0);
+}

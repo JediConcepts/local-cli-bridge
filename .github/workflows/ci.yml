@@ -32,6 +32,8 @@ jobs:
           node --check scripts/local-cli-bridge.mjs
           node --check scripts/bridge-tunnel.mjs
           node --check scripts/lib/load-bridge-env.mjs
+          node --check tests/helpers.mjs
+          node --check tests/fixtures/fake-cli.mjs
 
       - name: Smoke tests
         run: npm test
