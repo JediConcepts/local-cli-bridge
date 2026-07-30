@@ -61,6 +61,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { StringDecoder } from "node:string_decoder";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
 import { argsFromEnv } from "./lib/parse-argv.mjs";
 
@@ -89,6 +90,17 @@ const KEEPALIVE_MS = positiveInteger(process.env.BRIDGE_KEEPALIVE_MS, 20_000, { 
 // Request body ceiling, matches the Claude CLI's 10MB stdin cap; a caller (or stolen
 // token) can't exhaust memory with an unbounded body.
 const MAX_BODY_BYTES = positiveInteger(process.env.BRIDGE_MAX_BODY_BYTES, 10 * 1024 * 1024);
+// Ceiling on TOTAL child process output — stdout + stderr + the Codex result
+// file — counted in raw bytes before decoding. Deliberately named "process
+// output": agent chatter and stderr logging count against it, not just the
+// model answer. Symmetric with the input cap so a broken (or hostile) backend
+// can't grow the bridge's memory without bound; on breach the child is killed
+// and the request fails.
+const MAX_PROCESS_OUTPUT_BYTES = positiveInteger(process.env.BRIDGE_MAX_PROCESS_OUTPUT_BYTES, 10 * 1024 * 1024);
+// Only a bounded tail of stderr is RETAINED for diagnostics (every byte still
+// counts against the output cap): stderr exists here to pick an error reason
+// out of, and the useful line is invariably near the end.
+const STDERR_TAIL_CHARS = 64 * 1024;
 // Every completion spawns a CLI process, cap how many run at once. Default 4 covers
 // a client legitimately running a few completions in parallel (long-running pipeline
 // stages often fan out) while keeping a request burst from forking a process storm;
@@ -398,10 +410,11 @@ function runBackend({ model, system, prompt }, { signal } = {}) {
     let out = "";
     let err = "";
     // The promise settles ONLY when the child closes (or fails to spawn), never
-    // at the moment of a timeout or client abort: the caller's finally-block
-    // releases the concurrency slot on settlement, so MAX_CONCURRENT stays a
-    // true ceiling on live child processes even while a kill is in flight.
-    let fate = null; // null | "timeout" | "aborted"
+    // at the moment of a timeout, client abort, or output breach: the caller's
+    // finally-block releases the concurrency slot on settlement, so
+    // MAX_CONCURRENT stays a true ceiling on live child processes even while a
+    // kill is in flight.
+    let fate = null; // null | "timeout" | "aborted" | "output-limit"
     const timer = setTimeout(() => {
       fate = "timeout";
       killChildGracefully(child);
@@ -417,21 +430,51 @@ function runBackend({ model, system, prompt }, { signal } = {}) {
       if (signal) signal.removeEventListener("abort", onAbort);
     };
 
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (err += d));
+    // Raw bytes are counted BEFORE decoding (both pipes share the one ceiling);
+    // StringDecoder carries multi-byte UTF-8 sequences across chunk boundaries,
+    // plain string concatenation of Buffers corrupts a character split between
+    // two chunks.
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
+    let outputBytes = 0;
+    const overOutputLimit = (d) => {
+      outputBytes += d.length;
+      if (fate) return true; // already dying, stop accumulating
+      if (outputBytes > MAX_PROCESS_OUTPUT_BYTES) {
+        fate = "output-limit";
+        killChildGracefully(child);
+        return true;
+      }
+      return false;
+    };
+    child.stdout.on("data", (d) => {
+      if (!overOutputLimit(d)) out += outDecoder.write(d);
+    });
+    child.stderr.on("data", (d) => {
+      if (!overOutputLimit(d)) {
+        err += errDecoder.write(d);
+        if (err.length > STDERR_TAIL_CHARS) err = err.slice(-STDERR_TAIL_CHARS);
+      }
+    });
     child.on("error", (e) => {
       cleanup();
       reject(new BridgeError(`Failed to spawn "${cmd}": ${e.message}`, { code: "SPAWN_FAILURE" }));
     });
     child.on("close", (code) => {
       cleanup();
+      out += outDecoder.end();
+      err += errDecoder.end();
       if (fate) {
         if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
-        return reject(
-          fate === "timeout"
-            ? new BridgeError(`CLI timed out after ${TIMEOUT_MS}ms`, { code: "BACKEND_TIMEOUT", safeToExpose: true })
-            : new BridgeError("client disconnected before the CLI finished", { code: "CLIENT_DISCONNECTED" }),
-        );
+        const fateError = {
+          "timeout": () => new BridgeError(`CLI timed out after ${TIMEOUT_MS}ms`, { code: "BACKEND_TIMEOUT", safeToExpose: true }),
+          "output-limit": () => new BridgeError(
+            `CLI produced more than ${MAX_PROCESS_OUTPUT_BYTES} bytes of output`,
+            { code: "OUTPUT_LIMIT_EXCEEDED", safeToExpose: true },
+          ),
+          "aborted": () => new BridgeError("client disconnected before the CLI finished", { code: "CLIENT_DISCONNECTED" }),
+        }[fate];
+        return reject(fateError());
       }
       if (code !== 0) {
         // Surface the most useful reason. Prefer a structured stdout error (Claude Code's
@@ -450,6 +493,19 @@ function runBackend({ model, system, prompt }, { signal } = {}) {
         }
         if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
         return reject(new BridgeError(`${cmd} failed (exit ${code}): ${reason.slice(0, 400)}`, { code: "BACKEND_FAILED" }));
+      }
+      // The Codex result file counts against the output cap too: stat-first so
+      // an oversized file is rejected without ever loading it into memory.
+      if (resultFile) {
+        let resultSize = 0;
+        try { resultSize = fs.statSync(resultFile).size; } catch { /* missing file: stdout fallback below */ }
+        if (resultSize > MAX_PROCESS_OUTPUT_BYTES) {
+          try { fs.unlinkSync(resultFile); } catch { /* ignore */ }
+          return reject(new BridgeError(
+            `CLI result file exceeded ${MAX_PROCESS_OUTPUT_BYTES} bytes`,
+            { code: "OUTPUT_LIMIT_EXCEEDED", safeToExpose: true },
+          ));
+        }
       }
       try {
         // Backends that write their answer to a file (Codex --output-last-message) are
@@ -607,7 +663,7 @@ function handleRequest(req, res) {
 
   if (req.method === "POST" && (url === "/v1/chat/completions" || url === "/chat/completions")) {
     if (!authOk(req)) return send(res, 401, { error: { message: "Unauthorized" } });
-    let raw = "";
+    const chunks = [];
     let receivedBytes = 0;
     let bodyTooLarge = false;
     req.on("data", (d) => {
@@ -620,13 +676,15 @@ function handleRequest(req, res) {
         req.destroy();
         return;
       }
-      raw += d;
+      chunks.push(d);
     });
     req.on("end", async () => {
       if (bodyTooLarge) return;
       let body;
       try {
-        body = JSON.parse(raw || "{}");
+        // Concatenate as raw bytes BEFORE decoding: a chunk boundary can split a
+        // multi-byte UTF-8 character, and per-chunk string coercion would corrupt it.
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
       } catch {
         return send(res, 400, { error: { message: "Invalid JSON body" } });
       }

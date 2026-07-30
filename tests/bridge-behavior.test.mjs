@@ -203,6 +203,63 @@ test("BRIDGE_COMMAND_JSON: the JSON array form is used verbatim and wins over BR
   }
 });
 
+test("multibyte UTF-8 backend output survives pipe chunk boundaries intact", async () => {
+  // "€" is 3 bytes; ~600KB of them guarantees 64KB pipe chunks split characters
+  // mid-sequence (65536 % 3 !== 0). Naive Buffer→string concatenation corrupts
+  // the split characters; StringDecoder must carry them across chunks.
+  const payload = "€".repeat(200_000);
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("echo"),
+    BRIDGE_API_KEY: KEY,
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody(payload) });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.choices[0].message.content, payload, "multibyte output was corrupted in transit");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("output over BRIDGE_MAX_PROCESS_OUTPUT_BYTES kills the child and fails the request", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("chatty --bytes 300000"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_MAX_PROCESS_OUTPUT_BYTES: "65536",
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.ok(body.error.message.includes("65536"), "output-limit message is safe to expose even with redaction on");
+    // The breach must not wound the server: it still answers.
+    const health = await fetch(`${bridge.base}/health`);
+    assert.equal(health.status, 200);
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("stderr chatter counts against the same output ceiling", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("chatty --bytes 300000 --stream stderr"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_MAX_PROCESS_OUTPUT_BYTES: "65536",
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.ok(body.error.message.includes("bytes"));
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("a backend that exits non-zero is a 502 with a redacted message by default", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
