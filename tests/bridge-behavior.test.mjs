@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startBridge, fakeCliCommand } from "./helpers.mjs";
+import { startBridge, fakeCliCommand, fakeCliJson } from "./helpers.mjs";
 
 const KEY = "test-key-123";
 const AUTH = { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` };
@@ -32,7 +32,7 @@ async function waitFor(check, { timeoutMs = 4000, everyMs = 50, what = "conditio
 test("concurrency limit: excess completions get a 429 while a slot is busy", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("slow --ms 2000"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("slow", "--ms", "2000"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_MAX_CONCURRENT: "1",
   });
@@ -56,7 +56,7 @@ test("concurrency limit: excess completions get a 429 while a slot is busy", asy
 test("a backend that outlives BRIDGE_TIMEOUT_MS is killed and reported as a 504 gateway timeout", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("slow --ms 30000"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("slow", "--ms", "30000"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_TIMEOUT_MS: "500",
   });
@@ -76,7 +76,7 @@ test("a cancelled request terminates the CLI child (SIGTERM delivered)", async (
   const marker = markerPath();
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand(`hang --marker ${marker}`),
+    BRIDGE_COMMAND_JSON: fakeCliJson("hang", "--marker", marker),
     BRIDGE_API_KEY: KEY,
   });
   try {
@@ -100,7 +100,7 @@ test("cancellation: slot is retained while the child is dying, freed after SIGKI
   const marker = markerPath();
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand(`hang-hard --marker ${marker}`),
+    BRIDGE_COMMAND_JSON: fakeCliJson("hang-hard", "--marker", marker),
     BRIDGE_API_KEY: KEY,
     BRIDGE_MAX_CONCURRENT: "1",
   });
@@ -121,18 +121,19 @@ test("cancellation: slot is retained while the child is dying, freed after SIGKI
     // After the 2s grace, SIGKILL reaps the child, runBackend settles, slot frees.
     // A new request is then ACCEPTED (it hangs by design, so a quick client-side
     // timeout distinguishes "accepted and running" from an instant 429).
+    // The assertion lives OUTSIDE the try: only the deliberate client-side
+    // timeout may be swallowed, never an assertion failure or a server error.
     await new Promise((r) => setTimeout(r, 2400));
-    let accepted = false;
+    let probeStatus = null; // null = client-side timeout = accepted and running
     try {
       const probe = await fetch(`${bridge.base}/v1/chat/completions`, {
         method: "POST", headers: AUTH, body: completionBody(), signal: AbortSignal.timeout(500),
       });
-      assert.notEqual(probe.status, 429, "slot never freed after the child was SIGKILLed");
-      accepted = true; // got a non-429 response somehow (should not happen with hang-hard)
-    } catch {
-      accepted = true; // timed out client-side: the request was accepted and is running
+      probeStatus = probe.status;
+    } catch (e) {
+      if (e.name !== "TimeoutError" && e.name !== "AbortError") throw e;
     }
-    assert.ok(accepted);
+    assert.notEqual(probeStatus, 429, "slot never freed after the child was SIGKILLed");
     // Give the bridge time to SIGKILL the probe's child too before tearing down,
     // so the test leaves no orphaned hang-hard processes behind.
     await new Promise((r) => setTimeout(r, 2600));
@@ -142,10 +143,65 @@ test("cancellation: slot is retained while the child is dying, freed after SIGKI
   }
 });
 
+test("a killed child whose grandchild holds the stdio pipes cannot strand the slot", async () => {
+  // 'close' waits for the pipes to drain; leaky-hang's grandchild inherits
+  // them and outlives the killed child. Settlement must be forced shortly
+  // after the direct child exits, well before the grandchild's 15s lifetime.
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND_JSON: fakeCliJson("leaky-hang"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_MAX_CONCURRENT: "1",
+  });
+  try {
+    const ac = new AbortController();
+    const doomed = fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody(), signal: ac.signal })
+      .catch(() => {});
+    await new Promise((r) => setTimeout(r, 400));
+    ac.abort(); // SIGTERM kills the direct child; the grandchild keeps the pipes open
+    await doomed;
+    await new Promise((r) => setTimeout(r, 2600)); // exit + forced-settlement grace
+    let probeStatus = null; // null = client-side timeout = accepted and running
+    try {
+      const probe = await fetch(`${bridge.base}/v1/chat/completions`, {
+        method: "POST", headers: AUTH, body: completionBody(), signal: AbortSignal.timeout(500),
+      });
+      probeStatus = probe.status;
+    } catch (e) {
+      if (e.name !== "TimeoutError" && e.name !== "AbortError") throw e;
+    }
+    assert.notEqual(probeStatus, 429, "slot stranded by a pipe-holding grandchild");
+    await new Promise((r) => setTimeout(r, 2600)); // let the bridge reap the probe's child too
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("an output-limit breach is not relabeled a timeout while the child is dying", async () => {
+  // The breach happens at ~50ms; the SIGTERM-trapping child then dies slowly
+  // past BRIDGE_TIMEOUT_MS. The timeout timer must not overwrite the fate:
+  // the client owes a 502 naming the output limit, not a 504 timeout.
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND_JSON: fakeCliJson("chatty", "--bytes", "50000", "--linger", "1"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_MAX_PROCESS_OUTPUT_BYTES: "1000",
+    BRIDGE_TIMEOUT_MS: "1000",
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody() });
+    assert.equal(res.status, 502, "output-limit breach must not be mislabeled as a 504 timeout");
+    const body = await res.json();
+    assert.ok(body.error.message.includes("1000 bytes"), `wrong failure reason: ${body.error.message}`);
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("cancellation: slot frees promptly when the killed child exits on SIGTERM", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("slow --ms 700"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("slow", "--ms", "700"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_MAX_CONCURRENT: "1",
   });
@@ -210,7 +266,7 @@ test("multibyte UTF-8 backend output survives pipe chunk boundaries intact", asy
   const payload = "€".repeat(200_000);
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("echo"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("echo"),
     BRIDGE_API_KEY: KEY,
   });
   try {
@@ -226,7 +282,7 @@ test("multibyte UTF-8 backend output survives pipe chunk boundaries intact", asy
 test("output over BRIDGE_MAX_PROCESS_OUTPUT_BYTES kills the child and fails the request", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("chatty --bytes 300000"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("chatty", "--bytes", "300000"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_MAX_PROCESS_OUTPUT_BYTES: "65536",
   });
@@ -246,7 +302,7 @@ test("output over BRIDGE_MAX_PROCESS_OUTPUT_BYTES kills the child and fails the 
 test("stderr chatter counts against the same output ceiling", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("chatty --bytes 300000 --stream stderr"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("chatty", "--bytes", "300000", "--stream", "stderr"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_MAX_PROCESS_OUTPUT_BYTES: "65536",
   });
@@ -263,7 +319,7 @@ test("stderr chatter counts against the same output ceiling", async () => {
 test("forced numeric keepalive: success arrives as 200 with exactly one JSON object after heartbeat whitespace", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("slow --ms 300"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("slow", "--ms", "300"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_KEEPALIVE_MS: "50", // several heartbeats land before the backend finishes
   });
@@ -282,7 +338,7 @@ test("forced numeric keepalive: success arrives as 200 with exactly one JSON obj
 test("forced numeric keepalive: a late backend failure arrives IN-BODY on the committed 200", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("fail --msg boom"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("fail", "--msg", "boom"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_KEEPALIVE_MS: "50",
   });
@@ -301,7 +357,7 @@ test("forced numeric keepalive: a late backend failure arrives IN-BODY on the co
 test("keepalive auto: a request claiming Cloudflare forwarding gets the heartbeat contract", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("fail --msg boom"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("fail", "--msg", "boom"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_KEEPALIVE_MS: "auto",
   });
@@ -322,7 +378,7 @@ test("keepalive auto: a request claiming Cloudflare forwarding gets the heartbea
 test("keepalive auto: a direct local request keeps its real error status code", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand("fail --msg boom"),
+    BRIDGE_COMMAND_JSON: fakeCliJson("fail", "--msg", "boom"),
     BRIDGE_API_KEY: KEY,
     BRIDGE_KEEPALIVE_MS: "auto",
   });
@@ -337,7 +393,7 @@ test("keepalive auto: a direct local request keeps its real error status code", 
 test("a backend that exits non-zero is a 502 with a redacted message by default", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",
-    BRIDGE_COMMAND: fakeCliCommand('fail --msg secret-path-do-not-leak'),
+    BRIDGE_COMMAND_JSON: fakeCliJson("fail", "--msg", "secret-path-do-not-leak"),
     BRIDGE_API_KEY: KEY,
   });
   try {

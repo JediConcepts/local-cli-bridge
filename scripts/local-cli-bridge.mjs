@@ -451,26 +451,64 @@ function runBackend({ model, system, prompt }, { signal } = {}) {
     const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: childEnv, cwd: os.tmpdir() });
     let out = "";
     let err = "";
-    // The promise settles ONLY when the child closes (or fails to spawn), never
-    // at the moment of a timeout, client abort, or output breach: the caller's
-    // finally-block releases the concurrency slot on settlement, so
-    // MAX_CONCURRENT stays a true ceiling on live child processes even while a
-    // kill is in flight.
+    // The promise never settles at the MOMENT of a timeout, client abort, or
+    // output breach — the caller's finally-block releases the concurrency slot
+    // on settlement, so MAX_CONCURRENT stays a true ceiling on live child
+    // processes while a kill is in flight. Settlement happens on child 'close',
+    // or (fate paths only) shortly after child 'exit' if 'close' is stranded.
     let fate = null; // null | "timeout" | "aborted" | "output-limit"
+    // 'close' (the settlement event) waits for the stdio pipes to DRAIN, and a
+    // grandchild that inherited them can hold them open long after the direct
+    // child dies — without a guard, a killed child with a pipe-holding
+    // descendant would strand this promise, the concurrency slot, and the HTTP
+    // response forever. So: once the direct child has EXITED with a fate
+    // decided, settlement is forced shortly afterwards if 'close' never
+    // arrives. Normal completions still settle on 'close' (full output capture).
+    let exited = false;
+    let fateSettled = false;
+    let lateSettle = null;
+    const settleForFate = () => {
+      if (fateSettled) return;
+      fateSettled = true;
+      cleanup();
+      if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
+      const fateError = {
+        "timeout": () => new BridgeError(`CLI timed out after ${TIMEOUT_MS}ms`, { code: "BACKEND_TIMEOUT", safeToExpose: true }),
+        "output-limit": () => new BridgeError(
+          `CLI produced more than ${MAX_PROCESS_OUTPUT_BYTES} bytes of output`,
+          { code: "OUTPUT_LIMIT_EXCEEDED", safeToExpose: true },
+        ),
+        "aborted": () => new BridgeError("client disconnected before the CLI finished", { code: "CLIENT_DISCONNECTED" }),
+      }[fate];
+      reject(fateError());
+    };
+    const armLateSettle = () => {
+      if (!fate || !exited || lateSettle) return;
+      lateSettle = setTimeout(settleForFate, KILL_GRACE_MS);
+      lateSettle.unref();
+    };
     const timer = setTimeout(() => {
+      if (fate) return; // an already-decided fate must not be relabeled a timeout
       fate = "timeout";
       killChildGracefully(child);
+      armLateSettle();
     }, TIMEOUT_MS);
     const onAbort = () => {
       if (fate) return;
       fate = "aborted";
       killChildGracefully(child);
+      armLateSettle();
     };
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
     const cleanup = () => {
       clearTimeout(timer);
+      if (lateSettle) clearTimeout(lateSettle);
       if (signal) signal.removeEventListener("abort", onAbort);
     };
+    child.on("exit", () => {
+      exited = true;
+      armLateSettle();
+    });
 
     // Raw bytes are counted BEFORE decoding (both pipes share the one ceiling);
     // StringDecoder carries multi-byte UTF-8 sequences across chunk boundaries,
@@ -485,6 +523,7 @@ function runBackend({ model, system, prompt }, { signal } = {}) {
       if (outputBytes > MAX_PROCESS_OUTPUT_BYTES) {
         fate = "output-limit";
         killChildGracefully(child);
+        armLateSettle(); // data can still arrive from a descendant after the child exited
         return true;
       }
       return false;
@@ -506,18 +545,7 @@ function runBackend({ model, system, prompt }, { signal } = {}) {
       cleanup();
       out += outDecoder.end();
       err += errDecoder.end();
-      if (fate) {
-        if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
-        const fateError = {
-          "timeout": () => new BridgeError(`CLI timed out after ${TIMEOUT_MS}ms`, { code: "BACKEND_TIMEOUT", safeToExpose: true }),
-          "output-limit": () => new BridgeError(
-            `CLI produced more than ${MAX_PROCESS_OUTPUT_BYTES} bytes of output`,
-            { code: "OUTPUT_LIMIT_EXCEEDED", safeToExpose: true },
-          ),
-          "aborted": () => new BridgeError("client disconnected before the CLI finished", { code: "CLIENT_DISCONNECTED" }),
-        }[fate];
-        return reject(fateError());
-      }
+      if (fate) return settleForFate();
       if (code !== 0) {
         // Surface the most useful reason. Prefer a structured stdout error (Claude Code's
         // {"is_error":true,"result":"Not logged in…"}); otherwise pick the stderr line that

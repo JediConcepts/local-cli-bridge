@@ -13,14 +13,20 @@
 //   hang              never exit; a SIGTERM writes --marker (if set) and exits 0
 //   hang-hard         never exit; SIGTERM is trapped and IGNORED (writes --marker),
 //                     only SIGKILL ends it — proves the bridge's kill escalation
+//   leaky-hang        spawns a grandchild that INHERITS our stdout/stderr pipes,
+//                     then hangs; killing us leaves the pipes held open, so the
+//                     bridge's 'close' for us cannot fire until the grandchild
+//                     exits (it self-terminates after 15s as an orphan net)
 // Options:
 //   --ms N        delay for `slow` (default 1000)
 //   --bytes N     stdout size for `chatty` (default 1024)
+//   --linger 1    chatty: after writing, trap SIGTERM and hang (SIGKILL only)
 //   --msg S       stderr text for `fail` (default "fake-cli failure")
 //   --marker P    file path written when SIGTERM arrives (hang / hang-hard)
 //   --prefix S    text prepended to the echo output (quoting round-trip check)
 
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 
 const argv = process.argv.slice(2);
 const mode = argv[0] && !argv[0].startsWith("--") ? argv[0] : "echo";
@@ -65,10 +71,19 @@ if (mode === "hang" || mode === "hang-hard") {
   });
   readStdin(); // drain stdin so the bridge's write never blocks
   setInterval(() => {}, 60_000); // keep the event loop alive forever
+} else if (mode === "leaky-hang") {
+  spawn(process.execPath, ["-e", "setTimeout(()=>{},15000)"], { stdio: ["ignore", "inherit", "inherit"] });
+  readStdin(); // drain stdin so the bridge's write never blocks
+  setInterval(() => {}, 60_000); // hang until killed; SIGTERM ends us (default), not the grandchild
 } else if (mode === "chatty") {
   await readStdin();
   await writeBytes(Number(opts.bytes ?? 1024), opts.stream === "stderr" ? process.stderr : process.stdout);
-  process.exit(0);
+  if (opts.linger === "1") {
+    process.on("SIGTERM", () => {}); // keep dying slowly: only SIGKILL ends us
+    setInterval(() => {}, 60_000);
+  } else {
+    process.exit(0);
+  }
 } else if (mode === "fail") {
   await readStdin();
   await flushWrite(process.stderr, String(opts.msg ?? "fake-cli failure") + "\n");
