@@ -8,9 +8,22 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export const SERVER = path.join(here, "..", "scripts", "local-cli-bridge.mjs");
 export const FAKE_CLI = path.join(here, "fixtures", "fake-cli.mjs");
 
-/** BRIDGE_COMMAND template that runs the fake CLI fixture with the given args. */
+/**
+ * Exact-argv env value for BRIDGE_COMMAND_JSON: the fake CLI plus args,
+ * immune to spaces/quotes/backslashes in the node or checkout paths.
+ * Prefer this everywhere the template grammar itself isn't under test.
+ */
+export function fakeCliJson(...args) {
+  return JSON.stringify([process.execPath, FAKE_CLI, ...args]);
+}
+
+/**
+ * BRIDGE_COMMAND template running the fake CLI — deliberately exercises the
+ * quoted-template grammar. The interpolated paths are double-quoted so a
+ * checkout path containing spaces still tokenizes as two argv entries.
+ */
 export function fakeCliCommand(args = "echo") {
-  return `${process.execPath} ${FAKE_CLI} ${args}`.trim();
+  return `"${process.execPath}" "${FAKE_CLI}" ${args}`.trim();
 }
 
 /**
