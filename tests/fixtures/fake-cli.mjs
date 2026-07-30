@@ -32,21 +32,26 @@ for (let i = 0; i < argv.length; i++) {
 function readStdin() {
   return new Promise((resolve) => {
     let data = "";
+    process.stdin.setEncoding("utf8"); // decode across chunk boundaries, no split-character corruption
     process.stdin.on("data", (d) => (data += d));
     process.stdin.on("end", () => resolve(data));
     process.stdin.on("error", () => resolve(data));
   });
 }
 
-async function writeBytes(n) {
+// Awaiting each write's flush callback matters: process.exit() discards any
+// output still queued on the pipe, silently truncating large payloads.
+function flushWrite(stream, data) {
+  return new Promise((r) => stream.write(data, r));
+}
+
+async function writeBytes(n, stream = process.stdout) {
   const block = "x".repeat(65536);
   let left = n;
   while (left > 0) {
     const piece = left >= block.length ? block : "x".repeat(left);
     left -= piece.length;
-    if (!process.stdout.write(piece)) {
-      await new Promise((r) => process.stdout.once("drain", r));
-    }
+    await flushWrite(stream, piece);
   }
 }
 
@@ -62,16 +67,16 @@ if (mode === "hang" || mode === "hang-hard") {
   setInterval(() => {}, 60_000); // keep the event loop alive forever
 } else if (mode === "chatty") {
   await readStdin();
-  await writeBytes(Number(opts.bytes ?? 1024));
+  await writeBytes(Number(opts.bytes ?? 1024), opts.stream === "stderr" ? process.stderr : process.stdout);
   process.exit(0);
 } else if (mode === "fail") {
   await readStdin();
-  process.stderr.write(String(opts.msg ?? "fake-cli failure") + "\n");
+  await flushWrite(process.stderr, String(opts.msg ?? "fake-cli failure") + "\n");
   process.exit(1);
 } else {
   // echo / slow
   const input = await readStdin();
   if (mode === "slow") await new Promise((r) => setTimeout(r, Number(opts.ms ?? 1000)));
-  process.stdout.write((opts.prefix ?? "") + input);
+  await flushWrite(process.stdout, (opts.prefix ?? "") + input);
   process.exit(0);
 }
