@@ -12,7 +12,7 @@ const bridge = await startBridge({
   BRIDGE_BACKEND: "command",
   BRIDGE_COMMAND: "cat",
   BRIDGE_API_KEY: KEY,
-  BRIDGE_MODELS: "echo-1",
+  BRIDGE_MODELS: "echo-1,sonnet",
 });
 const BASE = bridge.base;
 
@@ -32,17 +32,22 @@ test("GET /health from loopback needs no auth and reports the backend", async ()
   const body = await res.json();
   assert.equal(body.ok, true);
   assert.equal(body.backend, "command");
-  assert.deepEqual(body.models, ["echo-1"]);
+  assert.deepEqual(body.models, ["echo-1", "sonnet"]);
 });
 
-test("GET /v1/models advertises models with capability figures and provenance", async () => {
+test("GET /v1/models: known families carry capability assumptions, unknown models omit figures", async () => {
   const res = await fetch(`${BASE}/v1/models`);
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.object, "list");
-  assert.equal(body.data[0].id, "echo-1");
-  assert.ok(Number.isInteger(body.data[0].context_window));
-  assert.ok(["override", "default", "unknown"].includes(body.data[0].caps_source));
+  const [unknown, known] = body.data;
+  assert.equal(unknown.id, "echo-1");
+  assert.equal(unknown.caps_source, "unknown");
+  assert.equal(unknown.context_window, undefined, "unknown models must not advertise invented figures");
+  assert.equal(known.id, "sonnet");
+  assert.equal(known.caps_source, "default");
+  assert.equal(known.context_window, 200000);
+  assert.equal(known.max_output_tokens, 64000);
 });
 
 test("POST /v1/chat/completions round trips through the command backend", async () => {
