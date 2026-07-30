@@ -260,6 +260,80 @@ test("stderr chatter counts against the same output ceiling", async () => {
   }
 });
 
+test("forced numeric keepalive: success arrives as 200 with exactly one JSON object after heartbeat whitespace", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("slow --ms 300"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_KEEPALIVE_MS: "50", // several heartbeats land before the backend finishes
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody("beat-me") });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.match(text, /^\s+\{/, "heartbeat whitespace precedes the body");
+    const body = JSON.parse(text); // throws on anything but ONE valid JSON value (+ surrounding whitespace)
+    assert.ok(body.choices[0].message.content.includes("beat-me"));
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("forced numeric keepalive: a late backend failure arrives IN-BODY on the committed 200", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("fail --msg boom"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_KEEPALIVE_MS: "50",
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody() });
+    assert.equal(res.status, 200, "status is already spent once the heartbeat starts");
+    const text = await res.text();
+    const body = JSON.parse(text);
+    assert.ok(body.error, "failure is delivered as an in-body error object");
+    assert.equal(body.error.type, "bridge_backend_error");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("keepalive auto: a request claiming Cloudflare forwarding gets the heartbeat contract", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("fail --msg boom"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_KEEPALIVE_MS: "auto",
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...AUTH, "cf-ray": "8a1b2c3d4e5f6789-LHR" }, // forged: auto is a header heuristic, not authenticated detection
+      body: completionBody(),
+    });
+    assert.equal(res.status, 200);
+    const body = JSON.parse(await res.text());
+    assert.ok(body.error, "tunnel-shaped traffic gets in-body errors");
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("keepalive auto: a direct local request keeps its real error status code", async () => {
+  const bridge = await startBridge({
+    BRIDGE_BACKEND: "command",
+    BRIDGE_COMMAND: fakeCliCommand("fail --msg boom"),
+    BRIDGE_API_KEY: KEY,
+    BRIDGE_KEEPALIVE_MS: "auto",
+  });
+  try {
+    const res = await fetch(`${bridge.base}/v1/chat/completions`, { method: "POST", headers: AUTH, body: completionBody() });
+    assert.equal(res.status, 502, "local traffic must not pay the errors-as-200 cost");
+  } finally {
+    bridge.stop();
+  }
+});
+
 test("a backend that exits non-zero is a 502 with a redacted message by default", async () => {
   const bridge = await startBridge({
     BRIDGE_BACKEND: "command",

@@ -30,8 +30,10 @@
  *   BRIDGE_TIMEOUT_MS  per-request CLI timeout (default 900000 = 15m; long-running
  *                      pipeline stages can take minutes)
  *   BRIDGE_API_KEY     if set, requests must send `Authorization: Bearer <it>`
- *   BRIDGE_KEEPALIVE_MS  whitespace heartbeat interval while the CLI runs (default 20000;
- *                      0 disables). See "Cloudflare 524" note on the completions handler.
+ *   BRIDGE_KEEPALIVE_MS  whitespace heartbeat while the CLI runs. Default "auto":
+ *                      heartbeat only for Cloudflare-forwarded requests (header
+ *                      heuristic), local requests keep real status codes. 0 never,
+ *                      N ms always. See "Cloudflare 524" note on the completions handler.
  *   BRIDGE_MAX_BODY_BYTES    request body ceiling (default 10485760 = 10MB, the CLI stdin cap)
  *   BRIDGE_MAX_CONCURRENT    max simultaneous CLI completions (default 4; excess → 429)
  *   BRIDGE_EXPOSE_ERROR_DETAILS  0 (default) returns a generic message + correlation id
@@ -83,10 +85,19 @@ const HOST = process.env.HOST || process.env.BRIDGE_HOST || "127.0.0.1";
 const BACKEND = process.env.BRIDGE_BACKEND || "claude";
 const DEFAULT_MODEL = process.env.BRIDGE_MODEL || "";
 const TIMEOUT_MS = positiveInteger(process.env.BRIDGE_TIMEOUT_MS, 900_000);
-// Whitespace heartbeat interval for in-flight completions (0 disables). 20s sits far
-// inside every relevant idle limit (Cloudflare's ~100s response-start ceiling, undici's
-// 300s bodyTimeout) without measurable overhead.
-const KEEPALIVE_MS = positiveInteger(process.env.BRIDGE_KEEPALIVE_MS, 20_000, { allowZero: true });
+// Whitespace heartbeat for in-flight completions. Default "auto": heartbeat ONLY
+// for requests that arrive Cloudflare-forwarded (a header heuristic, see
+// isTunnelForwarded), so purely local calls keep their real HTTP status codes
+// while tunnel traffic keeps its Cloudflare-524 defence. Numeric values keep the
+// absolute semantics: 0 never heartbeats, N heartbeats every N ms for EVERY
+// request. 20s sits far inside every relevant idle limit (Cloudflare's ~100s
+// response-start ceiling, undici's 300s bodyTimeout) without measurable overhead.
+const KEEPALIVE_MS = (() => {
+  const v = process.env.BRIDGE_KEEPALIVE_MS;
+  if (v === undefined || v === "" || v === "auto") return "auto";
+  return positiveInteger(v, 20_000, { allowZero: true });
+})();
+const AUTO_KEEPALIVE_MS = 20_000;
 // Request body ceiling, matches the Claude CLI's 10MB stdin cap; a caller (or stolen
 // token) can't exhaust memory with an unbounded body.
 const MAX_BODY_BYTES = positiveInteger(process.env.BRIDGE_MAX_BODY_BYTES, 10 * 1024 * 1024);
@@ -587,12 +598,28 @@ function authOk(req) {
 //    GET discovery only; completions always require the Bearer.
 const ALLOW_QUERY_KEY = process.env.BRIDGE_ALLOW_QUERY_KEY === "1";
 const TRUST_CF_ACCESS = process.env.BRIDGE_TRUST_CF_ACCESS === "1";
+/**
+ * Heuristic: the request CLAIMS to have come through Cloudflare's edge (cf-ray /
+ * cf-connecting-ip are always stamped by the edge). Any local caller can forge
+ * the headers, so this is NOT authenticated tunnel detection — it steers
+ * response framing (the keepalive heartbeat) and narrows browser conveniences,
+ * never authentication. Forging it merely turns the heartbeat on for that
+ * request, costing the forger their own real status code and nothing else.
+ */
+function isTunnelForwarded(req) {
+  return Boolean(req.headers["cf-ray"] || req.headers["cf-connecting-ip"]);
+}
 function isDirectLoopback(req) {
   const ra = req.socket?.remoteAddress || "";
   const loopback = ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
-  const viaTunnel = Boolean(req.headers["cf-ray"] || req.headers["cf-connecting-ip"]);
-  return loopback && !viaTunnel;
+  return loopback && !isTunnelForwarded(req);
 }
+/** Per-request heartbeat interval: "auto" heartbeats only tunnel-forwarded traffic. */
+function keepaliveMsFor(req) {
+  if (KEEPALIVE_MS === "auto") return isTunnelForwarded(req) ? AUTO_KEEPALIVE_MS : 0;
+  return KEEPALIVE_MS;
+}
+let warnedKeepaliveOffOnTunnel = false;
 function queryKeyOk(req) {
   if (!ALLOW_QUERY_KEY || !REQUIRE_KEY) return false;
   try {
@@ -721,12 +748,22 @@ function handleRequest(req, res) {
       // CLI failure is delivered IN-BODY as {"error":{...}} on the 200. Clients
       // must treat an `error` body as failure; auth/validation failures above still
       // return real 401/400 because they fail before this point.
-      if (KEEPALIVE_MS > 0) {
+      //
+      // That cost is only worth paying for traffic that actually crosses
+      // Cloudflare, so the default ("auto") heartbeats per request: requests
+      // carrying Cloudflare edge headers get the defence, direct/local requests
+      // keep their real status codes (a 504 timeout stays a 504).
+      const keepaliveMs = keepaliveMsFor(req);
+      if (KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
+        warnedKeepaliveOffOnTunnel = true;
+        console.warn("[bridge] tunnel-forwarded request with the keepalive disabled: responses slower than ~100s will die with a Cloudflare 524 (set BRIDGE_KEEPALIVE_MS=auto)");
+      }
+      if (keepaliveMs > 0) {
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
         res.write("\n");
       }
-      const beat = KEEPALIVE_MS > 0
-        ? setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, KEEPALIVE_MS)
+      const beat = keepaliveMs > 0
+        ? setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, keepaliveMs)
         : null;
       let settled = false;
       // A response 'close' before finish() means the CLIENT went away mid-flight
@@ -743,7 +780,7 @@ function handleRequest(req, res) {
         settled = true;
         if (beat) clearInterval(beat);
         if (res.writableEnded || res.destroyed) return;
-        if (KEEPALIVE_MS > 0) return res.end(JSON.stringify(obj)); // headers already sent
+        if (keepaliveMs > 0) return res.end(JSON.stringify(obj)); // headers already sent
         return send(res, status, obj);
       };
 
