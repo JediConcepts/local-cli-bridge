@@ -291,7 +291,9 @@ const BACKENDS = {
    */
   codex: {
     build({ model, system, prompt }) {
-      const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${Date.now()}.txt`);
+      // randomUUID, not Date.now(): two concurrent completions starting in the
+      // same millisecond must not share (and cross-read/unlink) one result file.
+      const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${crypto.randomUUID()}.txt`);
       const args = ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", outFile];
       const { id, effort } = splitModelEffort(model);
       if (id) args.push("--model", id);
@@ -781,6 +783,12 @@ function handleRequest(req, res) {
         body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
       } catch {
         return send(res, 400, { error: { message: "Invalid JSON body" } });
+      }
+      // A body of literal null / a string / an array parses fine but every
+      // property access below would throw (an unhandled rejection, since this
+      // is an async event handler) — reject non-objects up front.
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return send(res, 400, { error: { message: "JSON body must be an object" } });
       }
       // Validate shape + reject unimplemented OpenAI features BEFORE committing a 200.
       if (body.messages !== undefined && !Array.isArray(body.messages)) {

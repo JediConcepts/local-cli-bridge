@@ -124,6 +124,12 @@ test("codex build: system text is prepended to the piped prompt, not dropped", (
   assert.deepEqual(args.slice(-2), ["--model", "gpt-5.5"]);
 });
 
+test("codex build: concurrent builds get distinct result files", () => {
+  const a = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" });
+  const b = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" });
+  assert.notEqual(a.resultFile, b.resultFile, "same-millisecond completions must not share a result file");
+});
+
 test("codex build: no system means the prompt is piped unchanged", () => {
   const { stdin } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "bare" });
   assert.equal(stdin, "bare");
