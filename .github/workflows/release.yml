@@ -23,9 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node 24: Trusted Publishing's OIDC token exchange needs npm >= 11.5.1,
+      # and Node 20 bundles npm 10 (publish would die with ENEEDAUTH after an
+      # otherwise green run). The package itself still supports Node >= 18.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Syntax check

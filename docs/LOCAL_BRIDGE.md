@@ -64,7 +64,7 @@ single custom endpoint in your application and pick the model per request. Set
 | `BRIDGE_COMMAND` |, | `command` backend: a quoted command template; `{model}` tokens are substituted, prompt piped to stdin. Quoting and backslash escapes are supported (a **limited argv parser** — no shell expansion, no substitution; see `scripts/lib/parse-argv.mjs` for the exact grammar) |
 | `BRIDGE_COMMAND_JSON` |, | `command` backend, exact form: a JSON array of strings (`'["ollama","run","{model}"]'`). Wins over `BRIDGE_COMMAND` when both are set |
 | `BRIDGE_MODEL` |, | default model id when a request omits one |
-| `BRIDGE_MODELS` | claude only | comma-separated ids advertised on `/v1/models` to prefill a routing dropdown (claude default: `opus,sonnet,haiku`). Codex slugs vary per account, so set your own, e.g. `BRIDGE_MODELS="gpt-5.5,gpt-5.6-sol"`, otherwise discovery returns an empty list |
+| `BRIDGE_MODELS` | per-backend | comma-separated ids advertised on `/v1/models` to prefill a routing dropdown. Defaults: `claude` **and** `auto` advertise `opus,sonnet,haiku`; `codex` and `command` advertise nothing (empty list — a routing UI can fall back to free-text). Codex slugs vary per account, so set your own, e.g. `BRIDGE_MODELS="gpt-5.5,gpt-5.6-sol"` — especially in `auto` mode, where the Claude-only default otherwise prefills ids a Codex-only deployment can't serve |
 | `BRIDGE_TIMEOUT_MS` | `900000` | per-request CLI timeout; on expiry the child is killed (SIGTERM, then SIGKILL after 2s) and the request fails `504` |
 | `BRIDGE_API_KEY` |, | if set, callers must send `Authorization: Bearer <it>` |
 | `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat. `auto` heartbeats **only requests carrying Cloudflare edge headers** (a heuristic on `cf-ray` / `cf-connecting-ip` — forgeable, and forging merely turns the heartbeat on for that request), so local calls keep real status codes; `0` never heartbeats, a number heartbeats every N ms for every request (see [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md)) |
@@ -74,7 +74,7 @@ single custom endpoint in your application and pick the model per request. Set
 | `BRIDGE_EXPOSE_ERROR_DETAILS` | `0` | `1` returns raw backend error messages to the client (they can reveal executable names, paths, and login state), set it only on a trusted local deployment; the default returns a generic message + correlation id, with full detail in the server log |
 | `BRIDGE_ALLOW_QUERY_KEY` | `0` | `1` enables `GET /v1/models?key=<BRIDGE_API_KEY>` for browser viewing through the tunnel (key lands in history/logs, opt-in) |
 | `BRIDGE_TRUST_CF_ACCESS` | `0` | `1` lets requests that passed Cloudflare Access (edge-stamped `Cf-Access-Jwt-Assertion`) view GET discovery routes. Only sound while Access covers the hostname |
-| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND` |
+| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND`. Quotes group **and are stripped** (shell-style): a flag whose value must contain literal quotes — a Codex TOML override, say — needs them nested, `-c 'model_reasoning_effort="high"'`, or the `*_ARGS_JSON` form |
 | `BRIDGE_CLAUDE_ARGS_JSON` / `BRIDGE_CODEX_ARGS_JSON` |, | exact form: a JSON array of strings, wins over the plain variable when both are set |
 | `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them) |
 | `BRIDGE_ENV_FILE` |, | explicit env-file path, overriding the auto-load order below |
@@ -143,11 +143,14 @@ This section is authoritative for what the bridge actually runs:
   Add hardening (`--permission-mode dontAsk --max-turns 1`) via `BRIDGE_CLAUDE_ARGS` if you
   want. JSON output has no token counts, so the bridge estimates them (~4 chars/token);
   stdin caps at 10 MB (fine for ~60k-token prompts).
-- **`codex`**, `codex exec --ephemeral --sandbox read-only --output-last-message <tmp>`,
-  prompt on stdin. Codex writes only its final message to `<tmp>`, which the bridge reads,
-  so agent chatter on stdout never pollutes the answer, and `read-only` blocks filesystem
-  writes. `codex exec` has no system-prompt flag, so system/developer text is **prepended
-  to the piped prompt** rather than dropped.
+- **`codex`**, `codex exec --ephemeral --sandbox read-only --skip-git-repo-check
+  --output-last-message <tmp>`, prompt on stdin. Codex writes only its final message to
+  `<tmp>`, which the bridge reads, so agent chatter on stdout never pollutes the answer,
+  and `read-only` blocks filesystem writes. `--skip-git-repo-check` is required because
+  the bridge runs every CLI from a neutral temp directory (not a git repo) — keep it if
+  you reproduce the command by hand from somewhere else. `codex exec` has no
+  system-prompt flag, so system/developer text is **prepended to the piped prompt**
+  rather than dropped.
 
 ### Cancellation
 
