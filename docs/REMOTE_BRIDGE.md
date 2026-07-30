@@ -106,8 +106,12 @@ npm run bridge:tunnel
 
 `BRIDGE_TUNNEL_CONFIG` is **required whenever a default `~/.cloudflared/config.yml` already
 exists** for another tunnel, it tells `cloudflared` which config to run so the two don't
-collide. See the env table in [LOCAL_BRIDGE.md](./LOCAL_BRIDGE.md) for `BRIDGE_BACKEND` /
-`BRIDGE_MODELS` / `PORT` / `CLOUDFLARED_BIN`.
+collide. Note the launcher applies its own defaults to the bridge it starts —
+`BRIDGE_BACKEND=auto` and `BRIDGE_MODELS=opus,sonnet,haiku,gpt-5.5`, NOT the plain
+bridge's `claude`-backend defaults — so set both explicitly if your deployment serves
+only one CLI family. `PORT` and the rest are in the
+[LOCAL_BRIDGE.md](./LOCAL_BRIDGE.md) env table; `CLOUDFLARED_BIN` (path to the
+`cloudflared` binary) is documented in [`.env.example`](../.env.example).
 
 ### Protect the hostname with Cloudflare Access
 

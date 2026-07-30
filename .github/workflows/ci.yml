@@ -1,6 +1,6 @@
 # CI for local-cli-bridge. Zero dependencies, so no install step: syntax
-# check all three scripts, then run the node:test smoke suite (which boots
-# the bridge with the `command` backend, no external CLI required).
+# check every script and test helper, then run the node:test suite (which
+# boots the bridge with the `command` backend, no external CLI required).
 name: CI
 
 on:

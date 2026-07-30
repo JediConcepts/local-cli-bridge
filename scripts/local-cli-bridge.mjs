@@ -281,7 +281,8 @@ const BACKENDS = {
 
   /**
    * Codex CLI in non-interactive exec mode:
-   *   codex exec --ephemeral --sandbox read-only --output-last-message <tmp>
+   *   codex exec --ephemeral --sandbox read-only --skip-git-repo-check --output-last-message <tmp>
+   * (--skip-git-repo-check because the child runs from a neutral tmpdir, not a git repo.)
    * The prompt is piped on stdin; Codex writes ONLY its final message to <tmp>, which
    * the runner reads back, so agent chatter on stdout never pollutes the completion.
    * read-only sandbox means it can't modify the filesystem. Codex uses its own

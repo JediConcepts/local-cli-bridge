@@ -37,6 +37,19 @@ test("quotes concatenate with adjacent text into one token", () => {
   assert.deepEqual(parseCommandArgs('cli --opt="a b"'), ["cli", "--opt=a b"]);
 });
 
+test("MIGRATION: quotes group-and-strip, so literal quotes must be nested (or use *_JSON)", () => {
+  // The old split(/\s+/) passed inner quotes through untouched; the parser
+  // strips them shell-style. The nested single-quote form preserves them —
+  // this pair pins the documented migration for Codex TOML overrides.
+  assert.deepEqual(parseCommandArgs('-c model_reasoning_effort="high"'), ["-c", "model_reasoning_effort=high"]);
+  assert.deepEqual(parseCommandArgs(`-c 'model_reasoning_effort="high"'`), ["-c", 'model_reasoning_effort="high"']);
+});
+
+test("MIGRATION: bare backslashes escape instead of passing through", () => {
+  assert.deepEqual(parseCommandArgs("cli --re \\d+"), ["cli", "--re", "d+"]);
+  assert.deepEqual(parseCommandArgs("cli --re '\\d+'"), ["cli", "--re", "\\d+"]);
+});
+
 test("unbalanced quotes and trailing backslash fail loudly", () => {
   assert.throws(() => parseCommandArgs('cli "unclosed'), /Unbalanced double quote/);
   assert.throws(() => parseCommandArgs("cli 'unclosed"), /Unbalanced single quote/);
