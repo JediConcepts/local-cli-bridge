@@ -23,17 +23,23 @@
  * Env:
  *   PORT               (default 8787)
  *   HOST               (default 127.0.0.1, loopback; set 0.0.0.0 only if you must)
- *   BRIDGE_BACKEND     claude | codex | command
- *   BRIDGE_COMMAND     for backend=command: a shell-word template; {model} is substituted,
- *                      the system+prompt text is written to the process stdin
+ *   BRIDGE_BACKEND     claude | codex | command | auto
+ *   BRIDGE_COMMAND     for backend=command: a quoted command template ({model} is
+ *                      substituted, the system+prompt text is written to the process
+ *                      stdin). Quoting supported via lib/parse-argv.mjs — no shell.
+ *                      BRIDGE_COMMAND_JSON (a JSON array of strings) is the exact form.
  *   BRIDGE_MODEL       default model id when a request omits one
  *   BRIDGE_TIMEOUT_MS  per-request CLI timeout (default 900000 = 15m; long-running
  *                      pipeline stages can take minutes)
  *   BRIDGE_API_KEY     if set, requests must send `Authorization: Bearer <it>`
- *   BRIDGE_KEEPALIVE_MS  whitespace heartbeat interval while the CLI runs (default 20000;
- *                      0 disables). See "Cloudflare 524" note on the completions handler.
+ *   BRIDGE_KEEPALIVE_MS  whitespace heartbeat while the CLI runs. Default "auto":
+ *                      heartbeat only for Cloudflare-forwarded requests (header
+ *                      heuristic), local requests keep real status codes. 0 never,
+ *                      N ms always. See "Cloudflare 524" note on the completions handler.
  *   BRIDGE_MAX_BODY_BYTES    request body ceiling (default 10485760 = 10MB, the CLI stdin cap)
- *   BRIDGE_MAX_CONCURRENT    max simultaneous CLI completions (default 4; excess → 429)
+ *   BRIDGE_MAX_PROCESS_OUTPUT_BYTES  ceiling on total child output, stdout+stderr+result
+ *                      file (default 10485760 = 10MB; breach kills the child → 502)
+ *   BRIDGE_MAX_CONCURRENT    ceiling on live CLI child processes (default 4; excess → 429)
  *   BRIDGE_EXPOSE_ERROR_DETAILS  0 (default) returns a generic message + correlation id
  *                      to the client, full details stay in the server log. Set 1
  *                      explicitly to return raw backend error messages ("Not logged
@@ -60,7 +66,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { StringDecoder } from "node:string_decoder";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
+import { argsFromEnv } from "./lib/parse-argv.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Pull BRIDGE_* config from .env.bridge.local / .env.local (allowlisted) before reading it,
 // so the command can be run bare. Inline env still wins.
@@ -80,13 +91,33 @@ const HOST = process.env.HOST || process.env.BRIDGE_HOST || "127.0.0.1";
 const BACKEND = process.env.BRIDGE_BACKEND || "claude";
 const DEFAULT_MODEL = process.env.BRIDGE_MODEL || "";
 const TIMEOUT_MS = positiveInteger(process.env.BRIDGE_TIMEOUT_MS, 900_000);
-// Whitespace heartbeat interval for in-flight completions (0 disables). 20s sits far
-// inside every relevant idle limit (Cloudflare's ~100s response-start ceiling, undici's
-// 300s bodyTimeout) without measurable overhead.
-const KEEPALIVE_MS = positiveInteger(process.env.BRIDGE_KEEPALIVE_MS, 20_000, { allowZero: true });
+// Whitespace heartbeat for in-flight completions. Default "auto": heartbeat ONLY
+// for requests that arrive Cloudflare-forwarded (a header heuristic, see
+// isTunnelForwarded), so purely local calls keep their real HTTP status codes
+// while tunnel traffic keeps its Cloudflare-524 defence. Numeric values keep the
+// absolute semantics: 0 never heartbeats, N heartbeats every N ms for EVERY
+// request. 20s sits far inside every relevant idle limit (Cloudflare's ~100s
+// response-start ceiling, undici's 300s bodyTimeout) without measurable overhead.
+const KEEPALIVE_MS = (() => {
+  const v = process.env.BRIDGE_KEEPALIVE_MS;
+  if (v === undefined || v === "" || v === "auto") return "auto";
+  return positiveInteger(v, 20_000, { allowZero: true });
+})();
+const AUTO_KEEPALIVE_MS = 20_000;
 // Request body ceiling, matches the Claude CLI's 10MB stdin cap; a caller (or stolen
 // token) can't exhaust memory with an unbounded body.
 const MAX_BODY_BYTES = positiveInteger(process.env.BRIDGE_MAX_BODY_BYTES, 10 * 1024 * 1024);
+// Ceiling on TOTAL child process output — stdout + stderr + the Codex result
+// file — counted in raw bytes before decoding. Deliberately named "process
+// output": agent chatter and stderr logging count against it, not just the
+// model answer. Symmetric with the input cap so a broken (or hostile) backend
+// can't grow the bridge's memory without bound; on breach the child is killed
+// and the request fails.
+const MAX_PROCESS_OUTPUT_BYTES = positiveInteger(process.env.BRIDGE_MAX_PROCESS_OUTPUT_BYTES, 10 * 1024 * 1024);
+// Only a bounded tail of stderr is RETAINED for diagnostics (every byte still
+// counts against the output cap): stderr exists here to pick an error reason
+// out of, and the useful line is invariably near the end.
+const STDERR_TAIL_CHARS = 64 * 1024;
 // Every completion spawns a CLI process, cap how many run at once. Default 4 covers
 // a client legitimately running a few completions in parallel (long-running pipeline
 // stages often fan out) while keeping a request burst from forking a process storm;
@@ -116,32 +147,34 @@ const ADVERTISED_MODELS = (process.env.BRIDGE_MODELS || DEFAULT_MODELS_BY_BACKEN
   .map((s) => s.trim())
   .filter(Boolean);
 
-// The bridge is the AUTHORITY on local model capabilities (context + output), but
-// neither the Claude Code CLI nor the Codex CLI exposes a machine-readable per-model
-// capability endpoint, so NONE of these values are ever "discovered" from the CLI. They
-// are configured DEFAULTS (a known-model assumption) or operator OVERRIDES. Every
-// /v1/models entry is stamped with `caps_source` so a consumer can tell an assumption
-// from a confirmed value and never presents a family default as though the CLI reported it:
-//   "override", operator-set via BRIDGE_MODEL_CAPS (authoritative for this deployment)
-//   "default" , a family fallback below (a documented per-family API limit, NOT discovered)
-//   "unknown" , no family matched; conservative floor
-// Output ceilings track each model's real API max_tokens: Opus 4.x caps at 32k,
-// Sonnet/Haiku 4.x reach 64k. GPT-5.x figures follow the official OpenAI model catalog
-// (developers.openai.com/api/docs/models, checked 2026-07-21): the 5.6 family and
-// 5.4/5.4-pro are 1,050,000 context; 5.5 ≈ 1,000,000; 5.4-mini/nano and bare gpt-5 are
-// 400,000, all with 128,000 max output. NOTE the context window is SHARED by prompt +
-// reasoning + output, so 1M in AND 128k out in one request is not generally achievable.
-// First matching row wins (order specific → generic). Override per model with
-// BRIDGE_MODEL_CAPS="gpt-5.5=1000000:128000,opus=200000:32000".
-const MODEL_CAPS_DEFAULTS = [
-  [/\bopus\b/i,                  200000, 32000], // Opus 4.x API output ceiling is 32k, not 64k
-  [/\b(sonnet|haiku)\b|claude/i, 200000, 64000],
-  [/gpt-?5\.6/i,                1050000, 128000], // sol / terra / luna
-  [/gpt-?5\.5/i,                1000000, 128000],
-  [/gpt-?5\.4-(mini|nano)/i,     400000, 128000],
-  [/gpt-?5\.4/i,                1050000, 128000], // incl. -pro
-  [/gpt-?5\b|codex/i,            400000, 128000], // bare gpt-5 / unknown Codex slugs, conservative
-];
+// Model capabilities (context + output) are the bridge's CONFIGURED ASSUMPTIONS,
+// never discovered values: neither the Claude Code CLI nor the Codex CLI exposes a
+// machine-readable per-model capability endpoint. Known-family defaults live in
+// config/model-capability-defaults.json (resolved relative to this module, so the
+// npm-installed binary finds it from any cwd); operators override per deployment
+// with BRIDGE_MODEL_CAPS="gpt-5.5=1000000:128000,opus=200000:32000". Every
+// /v1/models entry is stamped with `caps_source` so a consumer can tell what it
+// is getting:
+//   "override", operator-set via BRIDGE_MODEL_CAPS for this deployment
+//   "default" , a family figure from the config file (a documented API limit,
+//               NOT read from any CLI)
+//   "unknown" , no family matched — capability figures are OMITTED entirely
+//               rather than invented, a prompt-sizing consumer must not treat a
+//               made-up floor as meaningful
+// Fail-soft: a missing or corrupt config file logs a warning and every model
+// simply reports "unknown"; a capability table must never stop completions.
+const MODEL_CAPS_DEFAULTS = (() => {
+  const file = path.join(here, "..", "config", "model-capability-defaults.json");
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return (parsed.defaults || []).map((e) => [new RegExp(e.match, "i"), e.context_window, e.max_output_tokens]);
+  } catch (e) {
+    console.warn(`[bridge] could not load model capability defaults (${file}): ${e.message}; models will report caps_source "unknown"`);
+    return [];
+  }
+})();
+// Longest key first: overrides match by substring, so an operator listing both
+// "gpt" and "gpt-5.6" must have the specific entry win for gpt-5.6 models.
 const MODEL_CAPS_OVERRIDES = (process.env.BRIDGE_MODEL_CAPS || "")
   .split(",")
   .map((s) => s.trim())
@@ -151,7 +184,8 @@ const MODEL_CAPS_OVERRIDES = (process.env.BRIDGE_MODEL_CAPS || "")
     const [c, o] = (v || "").split(":").map((n) => Number(n));
     return { key: (k || "").trim().toLowerCase(), context: c, output: o };
   })
-  .filter((x) => x.key);
+  .filter((x) => x.key)
+  .sort((a, b) => b.key.length - a.key.length);
 
 function modelCaps(id) {
   const lower = (id || "").toLowerCase();
@@ -163,7 +197,7 @@ function modelCaps(id) {
   for (const [re, c, o] of MODEL_CAPS_DEFAULTS) {
     if (re.test(id)) return { context_window: c, max_output_tokens: o, caps_source: "default" };
   }
-  return { context_window: 128000, max_output_tokens: 8192, caps_source: "unknown" }; // conservative floor
+  return { caps_source: "unknown" }; // no figures: omitting beats inventing
 }
 const REQUIRE_KEY = process.env.BRIDGE_API_KEY || "";
 
@@ -230,7 +264,11 @@ const BACKENDS = {
       if (modelId) args.push("--model", modelId);
       if (effort && CLAUDE_EFFORTS.has(effort)) args.push("--effort", effort);
       if (system) args.push("--append-system-prompt", system);
-      const extra = (process.env.BRIDGE_CLAUDE_ARGS || "").split(/\s+/).filter(Boolean);
+      const extra = argsFromEnv({
+        json: process.env.BRIDGE_CLAUDE_ARGS_JSON,
+        text: process.env.BRIDGE_CLAUDE_ARGS,
+        label: "BRIDGE_CLAUDE_ARGS_JSON",
+      });
       return { cmd: "claude", args: [...args, ...extra], stdin: prompt };
     },
     parse(out) {
@@ -243,22 +281,36 @@ const BACKENDS = {
 
   /**
    * Codex CLI in non-interactive exec mode:
-   *   codex exec --ephemeral --sandbox read-only --output-last-message <tmp>
+   *   codex exec --ephemeral --sandbox read-only --skip-git-repo-check --output-last-message <tmp>
+   * (--skip-git-repo-check because the child runs from a neutral tmpdir, not a git repo.)
    * The prompt is piped on stdin; Codex writes ONLY its final message to <tmp>, which
    * the runner reads back, so agent chatter on stdout never pollutes the completion.
    * read-only sandbox means it can't modify the filesystem. Codex uses its own
    * ~/.codex/auth.json login (the child env has API keys stripped, see runBackend).
+   * `codex exec` has no system-prompt flag, so system text is prepended to the
+   * piped prompt (same shape as the command backend) rather than dropped.
    */
   codex: {
-    build({ model, prompt }) {
-      const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${Date.now()}.txt`);
+    build({ model, system, prompt }) {
+      // randomUUID, not Date.now(): two concurrent completions starting in the
+      // same millisecond must not share (and cross-read/unlink) one result file.
+      const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${crypto.randomUUID()}.txt`);
       const args = ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", outFile];
       const { id, effort } = splitModelEffort(model);
       if (id) args.push("--model", id);
       // -c parses its value as TOML, the inner double quotes are required.
       if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
-      const extra = (process.env.BRIDGE_CODEX_ARGS || "").split(/\s+/).filter(Boolean);
-      return { cmd: "codex", args: [...args, ...extra], stdin: prompt, resultFile: outFile };
+      const extra = argsFromEnv({
+        json: process.env.BRIDGE_CODEX_ARGS_JSON,
+        text: process.env.BRIDGE_CODEX_ARGS,
+        label: "BRIDGE_CODEX_ARGS_JSON",
+      });
+      return {
+        cmd: "codex",
+        args: [...args, ...extra],
+        stdin: system ? `${system}\n\n${prompt}` : prompt,
+        resultFile: outFile,
+      };
     },
     parse(out) {
       let t = (out || "").trim();
@@ -274,17 +326,25 @@ const BACKENDS = {
   },
 
   /**
-   * Universal escape hatch: BRIDGE_COMMAND is a whitespace-separated command whose
-   * `{model}` token is substituted; the combined system+prompt text is piped to stdin
-   * and the process's raw stdout is taken as the completion. Works for any CLI that
-   * reads a prompt on stdin and prints the answer.
+   * Universal escape hatch: BRIDGE_COMMAND is a quoted command template (see
+   * lib/parse-argv.mjs for the exact grammar — quoting supported, NO shell
+   * expansion) whose `{model}` tokens are substituted; the combined system+prompt
+   * text is piped to stdin and the process's raw stdout is taken as the completion.
+   * Works for any CLI that reads a prompt on stdin and prints the answer.
    *   BRIDGE_BACKEND=command BRIDGE_COMMAND='ollama run {model}'
+   * BRIDGE_COMMAND_JSON='["ollama","run","{model}"]' is the exact, quoting-proof form.
    */
   command: {
     build({ model, system, prompt }) {
-      const template = process.env.BRIDGE_COMMAND;
-      if (!template) throw new Error("BRIDGE_COMMAND is required for backend=command");
-      const parts = template.split(/\s+/).filter(Boolean).map((p) => p.replace("{model}", model || ""));
+      if (!process.env.BRIDGE_COMMAND_JSON && !process.env.BRIDGE_COMMAND) {
+        throw new Error("BRIDGE_COMMAND (or BRIDGE_COMMAND_JSON) is required for backend=command");
+      }
+      const parts = argsFromEnv({
+        json: process.env.BRIDGE_COMMAND_JSON,
+        text: process.env.BRIDGE_COMMAND,
+        label: "BRIDGE_COMMAND_JSON",
+      }).map((p) => p.replaceAll("{model}", model || ""));
+      if (!parts.length || !parts[0]) throw new Error("BRIDGE_COMMAND resolved to an empty command");
       return {
         cmd: parts[0],
         args: parts.slice(1),
@@ -299,14 +359,29 @@ const BACKENDS = {
 
 // ── OpenAI <-> CLI mapping ──────────────────────────────────────────────────────
 
-/** Flatten OpenAI `messages` into { system, prompt } the CLIs can take. */
+/**
+ * Flatten OpenAI `messages` into { system, prompt } the CLIs can take.
+ * `system` and `developer` messages both join into the system text (modern
+ * OpenAI clients send developer instructions where older ones sent system).
+ * The dominant case — exactly one user turn — passes through byte-identical,
+ * no label, so simple clients get exactly the prompt they sent. Multi-turn
+ * history renders as a labeled transcript (User: / Assistant: / Tool:): the
+ * CLIs are one-shot, so history arrives as readable context, with every turn
+ * labeled symmetrically rather than only the assistant's. No trailing
+ * completion cue is appended — its effect on the real CLIs is unverified.
+ */
+const ROLE_LABELS = { user: "User", assistant: "Assistant", tool: "Tool", function: "Tool" };
 function foldMessages(messages = []) {
-  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
-  const convo = messages
-    .filter((m) => m.role !== "system")
-    .map((m) => (m.role === "assistant" ? `Assistant: ${m.content}` : m.content))
+  const isSystem = (m) => m.role === "system" || m.role === "developer";
+  const system = messages.filter(isSystem).map((m) => m.content ?? "").join("\n\n");
+  const convo = messages.filter((m) => !isSystem(m));
+  if (convo.length === 1 && convo[0].role === "user") {
+    return { system, prompt: convo[0].content ?? "" };
+  }
+  const prompt = convo
+    .map((m) => `${ROLE_LABELS[m.role] || m.role}: ${m.content ?? ""}`)
     .join("\n\n");
-  return { system, prompt: convo };
+  return { system, prompt };
 }
 
 function estimateTokens(str) {
@@ -326,7 +401,40 @@ function resolveBackendName(model) {
   return process.env.BRIDGE_AUTO_DEFAULT || "claude"; // ambiguous id → default family
 }
 
-function runBackend({ model, system, prompt }) {
+// Typed bridge failure. `code` classifies the condition (BACKEND_TIMEOUT,
+// BACKEND_FAILED, SPAWN_FAILURE, PARSE_FAILURE, CLIENT_DISCONNECTED, ...) and
+// `safeToExpose` marks messages that reveal nothing about the host (no paths,
+// executables, or login state) and are actionable for remote callers even with
+// error redaction on.
+class BridgeError extends Error {
+  constructor(message, { code, safeToExpose = false } = {}) {
+    super(message);
+    this.name = "BridgeError";
+    this.code = code;
+    this.safeToExpose = safeToExpose;
+  }
+}
+
+// SIGTERM → SIGKILL grace: long enough for a CLI to flush and clean up, short
+// enough that cancellation pressure doesn't pile up dying children.
+const KILL_GRACE_MS = 2_000;
+
+// Best-effort child termination: SIGTERM first (lets the CLI clean up), SIGKILL
+// after a short grace if it ignored the signal. This signals the DIRECT child
+// only — subprocesses the CLI spawned itself may survive on some platforms
+// (no process-group management), and Windows signal semantics differ, so
+// cancellation is best effort, not a guarantee.
+function killChildGracefully(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return; // already gone
+  try { child.kill("SIGTERM"); } catch { /* already gone */ }
+  const hardKill = setTimeout(() => {
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
+  }, KILL_GRACE_MS);
+  hardKill.unref();
+  child.once("close", () => clearTimeout(hardKill));
+}
+
+function runBackend({ model, system, prompt }, { signal } = {}) {
   const backendName = resolveBackendName(model);
   const backend = BACKENDS[backendName];
   if (!backend) throw new Error(`Unknown backend "${backendName}" (claude | codex | command | auto)`);
@@ -339,23 +447,108 @@ function runBackend({ model, system, prompt }) {
   }
 
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new BridgeError("client disconnected before the CLI started", { code: "CLIENT_DISCONNECTED" }));
+    }
     // Neutral cwd so the CLI doesn't load the current project's config files.
     const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: childEnv, cwd: os.tmpdir() });
     let out = "";
     let err = "";
+    // The promise never settles at the MOMENT of a timeout, client abort, or
+    // output breach — the caller's finally-block releases the concurrency slot
+    // on settlement, so MAX_CONCURRENT stays a true ceiling on live child
+    // processes while a kill is in flight. Settlement happens on child 'close',
+    // or (fate paths only) shortly after child 'exit' if 'close' is stranded.
+    let fate = null; // null | "timeout" | "aborted" | "output-limit"
+    // 'close' (the settlement event) waits for the stdio pipes to DRAIN, and a
+    // grandchild that inherited them can hold them open long after the direct
+    // child dies — without a guard, a killed child with a pipe-holding
+    // descendant would strand this promise, the concurrency slot, and the HTTP
+    // response forever. So: once the direct child has EXITED with a fate
+    // decided, settlement is forced shortly afterwards if 'close' never
+    // arrives. Normal completions still settle on 'close' (full output capture).
+    let exited = false;
+    let fateSettled = false;
+    let lateSettle = null;
+    const settleForFate = () => {
+      if (fateSettled) return;
+      fateSettled = true;
+      cleanup();
+      if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
+      const fateError = {
+        "timeout": () => new BridgeError(`CLI timed out after ${TIMEOUT_MS}ms`, { code: "BACKEND_TIMEOUT", safeToExpose: true }),
+        "output-limit": () => new BridgeError(
+          `CLI produced more than ${MAX_PROCESS_OUTPUT_BYTES} bytes of output`,
+          { code: "OUTPUT_LIMIT_EXCEEDED", safeToExpose: true },
+        ),
+        "aborted": () => new BridgeError("client disconnected before the CLI finished", { code: "CLIENT_DISCONNECTED" }),
+      }[fate];
+      reject(fateError());
+    };
+    const armLateSettle = () => {
+      if (!fate || !exited || lateSettle) return;
+      lateSettle = setTimeout(settleForFate, KILL_GRACE_MS);
+      lateSettle.unref();
+    };
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`CLI timed out after ${TIMEOUT_MS}ms`));
+      if (fate) return; // an already-decided fate must not be relabeled a timeout
+      fate = "timeout";
+      killChildGracefully(child);
+      armLateSettle();
     }, TIMEOUT_MS);
-
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (err += d));
-    child.on("error", (e) => {
+    const onAbort = () => {
+      if (fate) return;
+      fate = "aborted";
+      killChildGracefully(child);
+      armLateSettle();
+    };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    const cleanup = () => {
       clearTimeout(timer);
-      reject(new Error(`Failed to spawn "${cmd}": ${e.message}`));
+      if (lateSettle) clearTimeout(lateSettle);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+    child.on("exit", () => {
+      exited = true;
+      armLateSettle();
+    });
+
+    // Raw bytes are counted BEFORE decoding (both pipes share the one ceiling);
+    // StringDecoder carries multi-byte UTF-8 sequences across chunk boundaries,
+    // plain string concatenation of Buffers corrupts a character split between
+    // two chunks.
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
+    let outputBytes = 0;
+    const overOutputLimit = (d) => {
+      outputBytes += d.length;
+      if (fate) return true; // already dying, stop accumulating
+      if (outputBytes > MAX_PROCESS_OUTPUT_BYTES) {
+        fate = "output-limit";
+        killChildGracefully(child);
+        armLateSettle(); // data can still arrive from a descendant after the child exited
+        return true;
+      }
+      return false;
+    };
+    child.stdout.on("data", (d) => {
+      if (!overOutputLimit(d)) out += outDecoder.write(d);
+    });
+    child.stderr.on("data", (d) => {
+      if (!overOutputLimit(d)) {
+        err += errDecoder.write(d);
+        if (err.length > STDERR_TAIL_CHARS) err = err.slice(-STDERR_TAIL_CHARS);
+      }
+    });
+    child.on("error", (e) => {
+      cleanup();
+      reject(new BridgeError(`Failed to spawn "${cmd}": ${e.message}`, { code: "SPAWN_FAILURE" }));
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      cleanup();
+      out += outDecoder.end();
+      err += errDecoder.end();
+      if (fate) return settleForFate();
       if (code !== 0) {
         // Surface the most useful reason. Prefer a structured stdout error (Claude Code's
         // {"is_error":true,"result":"Not logged in…"}); otherwise pick the stderr line that
@@ -372,7 +565,20 @@ function runBackend({ model, system, prompt }) {
           reason = lines.find((l) => /error|failed|not logged|unauthor|invalid|denied|panic/i.test(l)) || lines[0] || "unknown error";
         }
         if (resultFile) { try { fs.unlinkSync(resultFile); } catch { /* ignore */ } }
-        return reject(new Error(`${cmd} failed (exit ${code}): ${reason.slice(0, 400)}`));
+        return reject(new BridgeError(`${cmd} failed (exit ${code}): ${reason.slice(0, 400)}`, { code: "BACKEND_FAILED" }));
+      }
+      // The Codex result file counts against the output cap too: stat-first so
+      // an oversized file is rejected without ever loading it into memory.
+      if (resultFile) {
+        let resultSize = 0;
+        try { resultSize = fs.statSync(resultFile).size; } catch { /* missing file: stdout fallback below */ }
+        if (resultSize > MAX_PROCESS_OUTPUT_BYTES) {
+          try { fs.unlinkSync(resultFile); } catch { /* ignore */ }
+          return reject(new BridgeError(
+            `CLI result file exceeded ${MAX_PROCESS_OUTPUT_BYTES} bytes`,
+            { code: "OUTPUT_LIMIT_EXCEEDED", safeToExpose: true },
+          ));
+        }
       }
       try {
         // Backends that write their answer to a file (Codex --output-last-message) are
@@ -387,11 +593,14 @@ function runBackend({ model, system, prompt }) {
         }
         resolve(backend.parse(payload, { system, prompt }));
       } catch (e) {
-        reject(new Error(`Failed to parse ${cmd} output: ${e.message}\n${out.slice(0, 500)}`));
+        reject(new BridgeError(`Failed to parse ${cmd} output: ${e.message}\n${out.slice(0, 500)}`, { code: "PARSE_FAILURE" }));
       }
     });
 
     if (stdin != null) {
+      // A killed child can EPIPE the write; without a handler that stream error
+      // would crash the whole bridge process.
+      child.stdin.on("error", () => {});
       child.stdin.write(stdin);
       child.stdin.end();
     }
@@ -451,12 +660,28 @@ function authOk(req) {
 //    GET discovery only; completions always require the Bearer.
 const ALLOW_QUERY_KEY = process.env.BRIDGE_ALLOW_QUERY_KEY === "1";
 const TRUST_CF_ACCESS = process.env.BRIDGE_TRUST_CF_ACCESS === "1";
+/**
+ * Heuristic: the request CLAIMS to have come through Cloudflare's edge (cf-ray /
+ * cf-connecting-ip are always stamped by the edge). Any local caller can forge
+ * the headers, so this is NOT authenticated tunnel detection — it steers
+ * response framing (the keepalive heartbeat) and narrows browser conveniences,
+ * never authentication. Forging it merely turns the heartbeat on for that
+ * request, costing the forger their own real status code and nothing else.
+ */
+function isTunnelForwarded(req) {
+  return Boolean(req.headers["cf-ray"] || req.headers["cf-connecting-ip"]);
+}
 function isDirectLoopback(req) {
   const ra = req.socket?.remoteAddress || "";
   const loopback = ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
-  const viaTunnel = Boolean(req.headers["cf-ray"] || req.headers["cf-connecting-ip"]);
-  return loopback && !viaTunnel;
+  return loopback && !isTunnelForwarded(req);
 }
+/** Per-request heartbeat interval: "auto" heartbeats only tunnel-forwarded traffic. */
+function keepaliveMsFor(req) {
+  if (KEEPALIVE_MS === "auto") return isTunnelForwarded(req) ? AUTO_KEEPALIVE_MS : 0;
+  return KEEPALIVE_MS;
+}
+let warnedKeepaliveOffOnTunnel = false;
 function queryKeyOk(req) {
   if (!ALLOW_QUERY_KEY || !REQUIRE_KEY) return false;
   try {
@@ -483,16 +708,23 @@ let activeCompletions = 0;
 
 // OpenAI request features the bridge does NOT implement. Rejecting them loudly beats
 // silently ignoring them, a caller that sets `stream: true` would otherwise wait for
-// SSE that never comes and misread the buffered JSON.
+// SSE that never comes and misread the buffered JSON. An explicit `null` is treated
+// as absent throughout: several OpenAI SDKs serialize unset optionals as null.
 const UNSUPPORTED_FIELDS = ["tools", "tool_choice", "response_format", "functions"];
 function unsupportedFeature(body) {
-  if (body.stream === true) return "stream: true (the bridge returns a single buffered completion)";
-  if (body.n !== undefined && body.n !== 1) return "n > 1";
-  for (const f of UNSUPPORTED_FIELDS) if (body[f] !== undefined) return f;
+  if (body.stream !== undefined && body.stream !== false && body.stream !== null) {
+    return "stream (the bridge returns a single buffered completion)";
+  }
+  if (body.n != null && body.n !== 1) return "n > 1";
+  for (const f of UNSUPPORTED_FIELDS) if (body[f] != null) return f;
   return null;
 }
 
-const server = http.createServer((req, res) => {
+// The roles the bridge knows how to fold into a CLI prompt. Anything else is
+// rejected rather than silently rendered into prompt text.
+const ALLOWED_ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function"]);
+
+function handleRequest(req, res) {
   const url = (req.url || "").split("?")[0];
 
   // Auth-enforced liveness/readiness probe. Behind Cloudflare Access (edge) AND the
@@ -519,15 +751,16 @@ const server = http.createServer((req, res) => {
     const ids = ADVERTISED_MODELS.length ? ADVERTISED_MODELS : (DEFAULT_MODEL ? [DEFAULT_MODEL] : []);
     return send(res, 200, {
       object: "list",
-      // context_window / max_output_tokens make the bridge authoritative for consumers
-      // that size prompts from discovery.
+      // context_window / max_output_tokens report the bridge's CONFIGURED
+      // ASSUMPTIONS (caps_source tells a consumer which kind); unknown models
+      // carry no figures at all.
       data: ids.map((id) => ({ id, object: "model", owned_by: BACKEND, ...modelCaps(id) })),
     });
   }
 
   if (req.method === "POST" && (url === "/v1/chat/completions" || url === "/chat/completions")) {
     if (!authOk(req)) return send(res, 401, { error: { message: "Unauthorized" } });
-    let raw = "";
+    const chunks = [];
     let receivedBytes = 0;
     let bodyTooLarge = false;
     req.on("data", (d) => {
@@ -540,15 +773,23 @@ const server = http.createServer((req, res) => {
         req.destroy();
         return;
       }
-      raw += d;
+      chunks.push(d);
     });
     req.on("end", async () => {
       if (bodyTooLarge) return;
       let body;
       try {
-        body = JSON.parse(raw || "{}");
+        // Concatenate as raw bytes BEFORE decoding: a chunk boundary can split a
+        // multi-byte UTF-8 character, and per-chunk string coercion would corrupt it.
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
       } catch {
         return send(res, 400, { error: { message: "Invalid JSON body" } });
+      }
+      // A body of literal null / a string / an array parses fine but every
+      // property access below would throw (an unhandled rejection, since this
+      // is an async event handler) — reject non-objects up front.
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return send(res, 400, { error: { message: "JSON body must be an object" } });
       }
       // Validate shape + reject unimplemented OpenAI features BEFORE committing a 200.
       if (body.messages !== undefined && !Array.isArray(body.messages)) {
@@ -556,6 +797,9 @@ const server = http.createServer((req, res) => {
       }
       if ((body.messages ?? []).some((m) => m == null || (m.content != null && typeof m.content !== "string"))) {
         return send(res, 400, { error: { message: "message content must be a string (content blocks are not supported)" } });
+      }
+      if ((body.messages ?? []).some((m) => !ALLOWED_ROLES.has(m.role))) {
+        return send(res, 400, { error: { message: `message role must be one of: ${[...ALLOWED_ROLES].join(", ")}` } });
       }
       const unsupported = unsupportedFeature(body);
       if (unsupported) {
@@ -583,23 +827,47 @@ const server = http.createServer((req, res) => {
       // CLI failure is delivered IN-BODY as {"error":{...}} on the 200. Clients
       // must treat an `error` body as failure; auth/validation failures above still
       // return real 401/400 because they fail before this point.
-      if (KEEPALIVE_MS > 0) {
+      //
+      // That cost is only worth paying for traffic that actually crosses
+      // Cloudflare, so the default ("auto") heartbeats per request: requests
+      // carrying Cloudflare edge headers get the defence, direct/local requests
+      // keep their real status codes (a 504 timeout stays a 504).
+      const keepaliveMs = keepaliveMsFor(req);
+      if (KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
+        warnedKeepaliveOffOnTunnel = true;
+        console.warn("[bridge] tunnel-forwarded request with the keepalive disabled: responses slower than ~100s will die with a Cloudflare 524 (set BRIDGE_KEEPALIVE_MS=auto)");
+      }
+      if (keepaliveMs > 0) {
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
         res.write("\n");
       }
-      const beat = KEEPALIVE_MS > 0
-        ? setInterval(() => { if (!res.writableEnded) res.write("\n"); }, KEEPALIVE_MS)
+      const beat = keepaliveMs > 0
+        ? setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, keepaliveMs)
         : null;
-      res.on("close", () => { if (beat) clearInterval(beat); });
-      const finish = (status, obj) => {
+      let settled = false;
+      // A response 'close' before finish() means the CLIENT went away mid-flight
+      // (it also fires after a normal end, hence the settled guard): abort the
+      // backend so the workstation isn't burning a CLI run nobody will read.
+      // The concurrency slot is NOT released here — runBackend only settles once
+      // the child has actually closed, so the slot keeps counting the dying child.
+      const ac = new AbortController();
+      res.on("close", () => {
         if (beat) clearInterval(beat);
-        if (res.writableEnded) return;
-        if (KEEPALIVE_MS > 0) return res.end(JSON.stringify(obj)); // headers already sent
+        if (!settled) ac.abort();
+      });
+      const finish = (status, obj) => {
+        settled = true;
+        if (beat) clearInterval(beat);
+        if (res.writableEnded || res.destroyed) return;
+        if (keepaliveMs > 0) return res.end(JSON.stringify(obj)); // headers already sent
         return send(res, status, obj);
       };
 
       try {
-        const { text, promptTokens, completionTokens } = await runBackend({ model: body.model, system, prompt });
+        const { text, promptTokens, completionTokens } = await runBackend(
+          { model: body.model, system, prompt },
+          { signal: ac.signal },
+        );
         console.log(
           `[bridge] ${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""} → ${text.length} chars in ${Date.now() - t0}ms`,
         );
@@ -613,14 +881,27 @@ const server = http.createServer((req, res) => {
           }),
         );
       } catch (e) {
+        if (e.code === "CLIENT_DISCONNECTED") {
+          // The socket is gone, there is nobody to answer; just record it.
+          console.log(`[bridge] client disconnected after ${Date.now() - t0}ms, ${resolveBackendName(body.model)} child terminated`);
+          return;
+        }
         // Full detail always lands in the SERVER log with a correlation id; whether the
         // CLIENT sees the raw message is governed by BRIDGE_EXPOSE_ERROR_DETAILS (raw
-        // messages can reveal executable names, paths, and login state, redacted by default).
+        // messages can reveal executable names, paths, and login state, redacted by
+        // default) — except BridgeErrors marked safeToExpose, which reveal nothing
+        // about the host and stay actionable for remote callers.
         const errorId = crypto.randomUUID();
         console.error(`[bridge] error ${errorId}: ${e.stack || e.message}`);
-        const message = EXPOSE_ERROR_DETAILS ? e.message : "The local model backend failed";
-        return finish(502, { error: { message, type: "bridge_backend_error", id: errorId } });
+        const message = EXPOSE_ERROR_DETAILS || e.safeToExpose ? e.message : "The local model backend failed";
+        // A timed-out backend is a gateway timeout; every other backend failure
+        // (spawn, non-zero exit, parse) is a bad gateway. With the keepalive
+        // heartbeat active the status is already spent and this arrives in-body.
+        const status = e.code === "BACKEND_TIMEOUT" ? 504 : 502;
+        return finish(status, { error: { message, type: "bridge_backend_error", id: errorId } });
       } finally {
+        // Settlement-scoped release: runBackend settles only after its child
+        // closed, so this can never let a new spawn overlap a dying child.
         activeCompletions -= 1;
       }
     });
@@ -628,36 +909,61 @@ const server = http.createServer((req, res) => {
   }
 
   send(res, 404, { error: { message: `No route for ${req.method} ${url}` } });
-});
+}
 
-// Friendly startup failures: EADDRINUSE is the most common first run collision
-// (something else, often another bridge, already owns the port).
-server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(`[bridge] port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
-    console.error(`[bridge] pick another port:  PORT=8790 npx local-cli-bridge`);
-    process.exit(1);
+/** Build (but do not bind) the bridge's HTTP server. */
+function createBridgeServer() {
+  return http.createServer(handleRequest);
+}
+
+// Pure pieces exported for unit tests; importing this module never starts a
+// server or registers signal handlers (see the is-main guard below).
+export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer, BridgeError };
+
+// realpath matters: npm installs bin entries as SYMLINKS (node_modules/.bin/…),
+// so argv[1] is the link while import.meta.url is the resolved file — without
+// resolving, the installed binary would import as a library and exit silently.
+const IS_MAIN = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+  } catch {
+    return false; // argv[1] not a resolvable path → we were imported, not executed
   }
-  if (err.code === "EACCES") {
-    console.error(`[bridge] no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
-    process.exit(1);
-  }
-  throw err;
-});
+})();
 
-server.listen(PORT, HOST, () => {
-  console.log(`[bridge] local-cli-bridge listening on http://${HOST}:${PORT}`);
-  console.log(`[bridge] backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
-  console.log(`[bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
-});
+if (IS_MAIN) {
+  const server = createBridgeServer();
 
-// Graceful shutdown: stop accepting connections, let in-flight completions drain
-// (their CLI children are killed by the runner's own timeout at worst).
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => {
-    console.log(`[bridge] ${sig}, shutting down`);
-    server.close(() => process.exit(0));
-    // Hard exit if a long completion holds the server open past a grace period.
-    setTimeout(() => process.exit(0), 5_000).unref();
+  // Friendly startup failures: EADDRINUSE is the most common first run collision
+  // (something else, often another bridge, already owns the port).
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[bridge] port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
+      console.error(`[bridge] pick another port:  PORT=8790 npx local-cli-bridge`);
+      process.exit(1);
+    }
+    if (err.code === "EACCES") {
+      console.error(`[bridge] no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
+      process.exit(1);
+    }
+    throw err;
   });
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[bridge] local-cli-bridge listening on http://${HOST}:${PORT}`);
+    console.log(`[bridge] backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
+    console.log(`[bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
+  });
+
+  // Graceful shutdown: stop accepting connections, let in-flight completions drain
+  // (their CLI children are killed by the runner's own timeout at worst).
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => {
+      console.log(`[bridge] ${sig}, shutting down`);
+      server.close(() => process.exit(0));
+      // Hard exit if a long completion holds the server open past a grace period.
+      setTimeout(() => process.exit(0), 5_000).unref();
+    });
+  }
 }

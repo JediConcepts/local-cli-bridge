@@ -106,8 +106,12 @@ npm run bridge:tunnel
 
 `BRIDGE_TUNNEL_CONFIG` is **required whenever a default `~/.cloudflared/config.yml` already
 exists** for another tunnel, it tells `cloudflared` which config to run so the two don't
-collide. See the env table in [LOCAL_BRIDGE.md](./LOCAL_BRIDGE.md) for `BRIDGE_BACKEND` /
-`BRIDGE_MODELS` / `PORT` / `CLOUDFLARED_BIN`.
+collide. Note the launcher applies its own defaults to the bridge it starts —
+`BRIDGE_BACKEND=auto` and `BRIDGE_MODELS=opus,sonnet,haiku,gpt-5.5`, NOT the plain
+bridge's `claude`-backend defaults — so set both explicitly if your deployment serves
+only one CLI family. `PORT` and the rest are in the
+[LOCAL_BRIDGE.md](./LOCAL_BRIDGE.md) env table; `CLOUDFLARED_BIN` (path to the
+`cloudflared` binary) is documented in [`.env.example`](../.env.example).
 
 ### Protect the hostname with Cloudflare Access
 
@@ -172,20 +176,32 @@ pipeline stage with a ~100k-token prompt, say) routinely takes minutes, so witho
 defence *every* long call through the tunnel dies at the 100s mark, regardless of any
 timeout you configure on the bridge or the client.
 
-The bridge defends itself (on by default): as soon as a `/v1/chat/completions` request
-passes auth + validation it **commits to a 200, sends a first byte immediately** (stopping
-the edge clock), then heartbeats a newline every `BRIDGE_KEEPALIVE_MS` (default 20000)
-until the CLI finishes, and finally writes the JSON body. Leading whitespace is valid
-JSON, so clients parse the response unchanged.
+The bridge defends itself per request (`BRIDGE_KEEPALIVE_MS=auto`, the default): a
+completion request that arrives **carrying Cloudflare edge headers** (`cf-ray` /
+`cf-connecting-ip`) **commits to a 200 and sends a first byte immediately** (stopping the
+edge clock), then heartbeats a newline every 20 seconds until the CLI finishes, and
+finally writes the JSON body. Leading whitespace is valid JSON, so clients parse the
+response unchanged. Requests **without** those headers — direct local calls to the same
+bridge — skip the heartbeat entirely and keep real HTTP status codes (a timeout is a
+`504`, a backend failure a `502`).
 
-Two consequences to know about:
+Note the detection is a **header heuristic, not authenticated tunnel detection**: any
+local caller could forge `cf-ray`, which merely turns the heartbeat on for that request
+and costs the forger their own status code. It steers response framing, never
+authentication.
 
-- A CLI failure **after** the heartbeat starts can't change the status code any more, it
-  is delivered in-body as `{"error":{...}}` on the 200. Your client must detect that
-  shape and fail the call properly; a generic OpenAI client that ignores `error` bodies
-  would see an empty completion instead.
-- Set `BRIDGE_KEEPALIVE_MS=0` to disable (restores plain buffered responses with real
-  error status codes), only sensible for a purely local, non-tunnelled bridge.
+Three consequences to know about:
+
+- For tunnel traffic, a CLI failure **after** the heartbeat starts can't change the
+  status code any more, it is delivered in-body as `{"error":{...}}` on the 200. Your
+  client must detect that shape and fail the call properly; a generic OpenAI client that
+  ignores `error` bodies would see an empty completion instead.
+- Set `BRIDGE_KEEPALIVE_MS` to a number to force the old absolute behavior: `0` never
+  heartbeats (the bridge logs a warning if tunnel-forwarded traffic then shows up), `N`
+  heartbeats every N ms for **every** request, local ones included.
+- If your tunnel arrangement somehow strips the Cloudflare headers before they reach the
+  bridge, `auto` would treat that traffic as local and long calls would 524 again —
+  verify with one long request, and force a numeric interval if needed.
 
 After updating the bridge script on the workstation, **restart the bridge process** to pick
 up the change.

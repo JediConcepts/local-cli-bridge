@@ -59,8 +59,10 @@ the caller.
 | `401 Unauthorized` | `BRIDGE_API_KEY` is set but the caller's `Authorization: Bearer …` doesn't match. |
 | `429` busy | More than `BRIDGE_MAX_CONCURRENT` (default 4) in-flight completions, raise it or retry. |
 | `413` | Request body over `BRIDGE_MAX_BODY_BYTES` (default 10 MB). |
-| `400 Unsupported request feature` | The bridge rejects `stream: true`, `tools`, `tool_choice`, `response_format`, `functions`, and `n > 1` loudly rather than silently ignoring them. |
-| Remote call dies at ~100s with a `524` | Cloudflare's edge waits ~100 seconds for response headers. The keep-alive heartbeat prevents this; ensure `BRIDGE_KEEPALIVE_MS` isn't `0`. See [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md). |
-| A `200` completion with an `{"error":{…}}` body | A backend failure after the keep-alive heartbeat committed the status code. Clients must treat an `error` body as failure. |
+| `400 Unsupported request feature` | The bridge rejects `stream`, `tools`, `tool_choice`, `response_format`, `functions`, and `n > 1` loudly rather than silently ignoring them (explicit `null` values are tolerated). |
+| `502 bridge_backend_error` | The CLI failed to spawn, exited non-zero, produced unparsable output, or exceeded `BRIDGE_MAX_PROCESS_OUTPUT_BYTES`. Full detail is in the server log under the correlation id. |
+| `504 bridge_backend_error` | The CLI outlived `BRIDGE_TIMEOUT_MS` and was killed. |
+| Remote call dies at ~100s with a `524` | Cloudflare's edge waits ~100 seconds for response headers. The default `BRIDGE_KEEPALIVE_MS=auto` heartbeats tunnel-forwarded requests to prevent this; ensure it isn't set to `0`, and see [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md) if your arrangement strips the Cloudflare headers. |
+| A `200` completion with an `{"error":{…}}` body | Tunnel-keepalive contract: the backend failure arrived after the heartbeat committed the status code. Clients must treat an `error` body as failure. Local (non-tunnel) requests keep real status codes under the default `auto`. |
 | Hostname 404s intermittently through the tunnel | Two connectors on one tunnel with different ingress, Cloudflare round-robins to the one lacking the hostname. Run ONE connector per tunnel (Arrangement A in [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md)). |
 | Generic error + `id` field in the response | Redacted error (default). Look up the correlation id in the bridge's server log for the full detail. |
