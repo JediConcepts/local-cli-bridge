@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>3D Tiles Fly-Through — London &amp; Monaco</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #canvas { position: fixed; inset: 0; display: block; }
+
+  .panel {
+    position: fixed; z-index: 10; color: #e8ecf5;
+    background: rgba(13, 18, 34, 0.82); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.10); border-radius: 14px;
+  }
+
+  #keyPanel {
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: min(440px, calc(100vw - 48px)); padding: 28px;
+  }
+  #keyPanel h1 { margin: 0 0 6px; font-size: 20px; }
+  #keyPanel p { margin: 8px 0; font-size: 13px; line-height: 1.55; color: #aeb8cc; }
+  #keyPanel a { color: #7fb4ff; }
+  #keyInput {
+    width: 100%; box-sizing: border-box; margin: 10px 0 12px; padding: 10px 12px;
+    font-size: 14px; color: #e8ecf5; background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.16); border-radius: 8px; outline: none;
+  }
+  #keyInput:focus { border-color: #7fb4ff; }
+
+  button {
+    cursor: pointer; font-size: 14px; font-weight: 600; color: #0b1020;
+    background: #7fb4ff; border: none; border-radius: 8px; padding: 10px 16px;
+  }
+  button:hover { background: #a4c9ff; }
+  button.secondary { background: rgba(255,255,255,0.10); color: #e8ecf5; }
+  button.secondary:hover { background: rgba(255,255,255,0.18); }
+  button.active { background: #ffd166; }
+
+  #hud {
+    top: 16px; left: 16px; padding: 12px 14px; display: none;
+    min-width: 230px; user-select: none;
+  }
+  #hud .row { display: flex; gap: 8px; margin-bottom: 10px; }
+  #hud .stat { font-size: 12px; color: #aeb8cc; white-space: pre-line; }
+  #waypointName {
+    position: fixed; z-index: 10; left: 50%; bottom: 64px; transform: translateX(-50%);
+    color: #fff; font-size: 22px; font-weight: 700; letter-spacing: 0.02em;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.8); pointer-events: none;
+    opacity: 0; transition: opacity 0.6s;
+  }
+  #credits {
+    position: fixed; z-index: 10; right: 8px; bottom: 6px;
+    font-size: 10px; color: rgba(255,255,255,0.75);
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9); pointer-events: none;
+  }
+  #help {
+    position: fixed; z-index: 10; left: 16px; bottom: 16px;
+    font-size: 11px; color: rgba(255,255,255,0.55); pointer-events: none; display: none;
+  }
+  #error {
+    top: 16px; left: 50%; transform: translateX(-50%);
+    padding: 10px 16px; font-size: 13px; color: #ffb4b4;
+    border-color: rgba(255,120,120,0.4); display: none; max-width: 70vw;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.175.0/examples/jsm/",
+    "3d-tiles-renderer": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.5.0/build/index.js",
+    "3d-tiles-renderer/plugins": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.5.0/build/index.plugins.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="keyPanel" class="panel">
+  <h1>3D Tiles Fly-Through</h1>
+  <p>Streams Google's <b>Photorealistic 3D Tiles</b> into a Three.js scene and flies you along the Thames in London or the Grand Prix line in Monaco.</p>
+  <p>You need a Google Maps Platform API key with the <b>Map Tiles API</b> enabled
+     (<a href="https://developers.google.com/maps/documentation/tile/get-api-key" target="_blank" rel="noreferrer">how to get one</a>).
+     The key is kept in your browser's localStorage only.</p>
+  <input id="keyInput" type="password" placeholder="Paste your Google Maps API key" autocomplete="off" />
+  <div style="display:flex; gap:10px;">
+    <button id="startLondon">Fly London</button>
+    <button id="startMonaco">Fly Monaco</button>
+  </div>
+</div>
+
+<div id="hud" class="panel">
+  <div class="row">
+    <button id="btnLondon" class="secondary">London</button>
+    <button id="btnMonaco" class="secondary">Monaco</button>
+    <button id="btnTour" class="secondary">Tour</button>
+  </div>
+  <div class="stat" id="stats"></div>
+</div>
+
+<div id="error" class="panel"></div>
+<div id="waypointName"></div>
+<div id="help">drag&nbsp;·&nbsp;rotate&nbsp;&nbsp;|&nbsp;&nbsp;right-drag&nbsp;·&nbsp;tilt&nbsp;&nbsp;|&nbsp;&nbsp;scroll&nbsp;·&nbsp;zoom&nbsp;&nbsp;|&nbsp;&nbsp;interacting pauses the tour</div>
+<div id="credits">Map data ©Google</div>
+
+<script type="module">
+import { Scene, WebGLRenderer, PerspectiveCamera, Vector3, CatmullRomCurve3, MathUtils } from 'three';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { TilesRenderer, GlobeControls, WGS84_ELLIPSOID, GeoUtils } from '3d-tiles-renderer';
+import {
+  GoogleCloudAuthPlugin, GLTFExtensionsPlugin, TileCompressionPlugin,
+  TilesFadePlugin, UnloadTilesPlugin
+} from '3d-tiles-renderer/plugins';
+
+// Heights are ellipsoid heights in meters (≈ altitude above sea level + ~47-50 m geoid offset).
+const CITIES = {
+  london: {
+    label: 'London — Thames run',
+    waypoints: [
+      { lat: 51.5030, lon: -0.0665, h: 340, name: 'Approaching Tower Bridge' },
+      { lat: 51.5047, lon: -0.0742, h: 310, name: 'Tower Bridge' },
+      { lat: 51.5074, lon: -0.0800, h: 320, name: 'Tower of London' },
+      { lat: 51.5077, lon: -0.0880, h: 400, name: 'The Shard' },
+      { lat: 51.5095, lon: -0.0935, h: 360, name: '' },
+      { lat: 51.5128, lon: -0.0987, h: 370, name: "St Paul's Cathedral" },
+      { lat: 51.5090, lon: -0.1105, h: 330, name: '' },
+      { lat: 51.5038, lon: -0.1172, h: 300, name: 'London Eye' },
+      { lat: 51.5008, lon: -0.1235, h: 280, name: 'Big Ben & Parliament' },
+      { lat: 51.5023, lon: -0.1330, h: 300, name: "St James's Park" },
+      { lat: 51.5014, lon: -0.1425, h: 330, name: 'Buckingham Palace' },
+    ],
+  },
+  monaco: {
+    label: 'Monaco — Grand Prix line',
+    waypoints: [
+      { lat: 43.7318, lon: 7.4188, h: 380, name: 'Le Rocher — Prince’s Palace' },
+      { lat: 43.7340, lon: 7.4208, h: 300, name: 'Start/Finish — Blvd Albert 1er' },
+      { lat: 43.7371, lon: 7.4212, h: 310, name: 'Sainte-Dévote' },
+      { lat: 43.7385, lon: 7.4245, h: 350, name: 'Beau Rivage climb' },
+      { lat: 43.7393, lon: 7.4277, h: 370, name: 'Casino de Monte-Carlo' },
+      { lat: 43.7398, lon: 7.4290, h: 340, name: 'Fairmont Hairpin' },
+      { lat: 43.7385, lon: 7.4303, h: 300, name: 'Portier & the Tunnel' },
+      { lat: 43.7364, lon: 7.4293, h: 270, name: 'Nouvelle Chicane' },
+      { lat: 43.7348, lon: 7.4272, h: 260, name: 'Piscine' },
+      { lat: 43.7334, lon: 7.4260, h: 280, name: 'La Rascasse' },
+      { lat: 43.7350, lon: 7.4268, h: 420, name: 'Port Hercules' },
+    ],
+  },
+};
+
+const TOUR_SPEED = 42;        // m/s along the path
+const LOOK_AHEAD = 0.015;     // curve fraction the camera looks toward
+const LOOK_DOWN = 55;         // meters the focus point sits below the path
+
+const params = new URLSearchParams(location.search);
+const storedKey = params.get('key') || localStorage.getItem('g3d_api_key') || '';
+
+const keyPanel = document.getElementById('keyPanel');
+const keyInput = document.getElementById('keyInput');
+const hud = document.getElementById('hud');
+const help = document.getElementById('help');
+const statsEl = document.getElementById('stats');
+const errorEl = document.getElementById('error');
+const creditsEl = document.getElementById('credits');
+const waypointEl = document.getElementById('waypointName');
+const btnTour = document.getElementById('btnTour');
+
+keyInput.value = storedKey;
+
+let renderer, scene, camera, controls, tiles;
+let tour = null;   // { curve, length, fractions, waypoints, t }
+let touring = false;
+let lastTime = performance.now();
+
+function toEcef( wp, target ) {
+  return WGS84_ELLIPSOID.getCartographicToPosition( wp.lat * MathUtils.DEG2RAD, wp.lon * MathUtils.DEG2RAD, wp.h, target );
+}
+
+function init( apiKey ) {
+  renderer = new WebGLRenderer( { canvas: document.getElementById( 'canvas' ), antialias: true, logarithmicDepthBuffer: true } );
+  renderer.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) );
+  renderer.setSize( window.innerWidth, window.innerHeight );
+  renderer.setClearColor( 0x87b7e8 );
+
+  scene = new Scene();
+  camera = new PerspectiveCamera( 60, window.innerWidth / window.innerHeight, 1, 1.6e8 );
+
+  tiles = new TilesRenderer();
+  tiles.registerPlugin( new GoogleCloudAuthPlugin( { apiToken: apiKey, autoRefreshToken: true } ) );
+  tiles.registerPlugin( new TileCompressionPlugin() );
+  tiles.registerPlugin( new TilesFadePlugin() );
+  tiles.registerPlugin( new UnloadTilesPlugin() );
+  tiles.registerPlugin( new GLTFExtensionsPlugin( {
+    dracoLoader: new DRACOLoader().setDecoderPath( 'https://www.gstatic.com/draco/v1/decoders/' ),
+  } ) );
+  tiles.setCamera( camera );
+  tiles.setResolutionFromRenderer( camera, renderer );
+  tiles.errorTarget = 12;
+  scene.add( tiles.group );
+
+  tiles.addEventListener( 'load-error', ( e ) => {
+    const msg = e?.error?.message || String( e?.error || 'unknown' );
+    showError( `Tile load error: ${ msg }. Check that the key is valid and the Map Tiles API is enabled for it.` );
+  } );
+
+  controls = new GlobeControls( scene, camera, renderer.domElement, null );
+  controls.enableDamping = true;
+  controls.setTilesRenderer( tiles );
+
+  // Any interaction hands control back to the user.
+  renderer.domElement.addEventListener( 'pointerdown', stopTour );
+  renderer.domElement.addEventListener( 'wheel', stopTour, { passive: true } );
+
+  window.addEventListener( 'resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize( window.innerWidth, window.innerHeight );
+    tiles.setResolutionFromRenderer( camera, renderer );
+  } );
+
+  setInterval( updateCredits, 1000 );
+  renderer.setAnimationLoop( animate );
+}
+
+function buildTour( cityKey ) {
+  const wps = CITIES[ cityKey ].waypoints;
+  const points = wps.map( ( wp ) => toEcef( wp, new Vector3() ) );
+  const curve = new CatmullRomCurve3( points, false, 'centripetal' );
+  const divisions = 400;
+  const lengths = curve.getLengths( divisions );
+  const total = lengths[ divisions ];
+  // Arc-length fraction of each control point, for the landmark labels.
+  const fractions = wps.map( ( _, i ) => lengths[ Math.round( ( i / ( wps.length - 1 ) ) * divisions ) ] / total );
+  return { curve, length: total, fractions, waypoints: wps, t: 0 };
+}
+
+function goToCity( cityKey ) {
+  tour = buildTour( cityKey );
+  document.getElementById( 'btnLondon' ).classList.toggle( 'active', cityKey === 'london' );
+  document.getElementById( 'btnMonaco' ).classList.toggle( 'active', cityKey === 'monaco' );
+  placeCameraOnTour( 0 );
+  startTour();
+}
+
+function placeCameraOnTour( t ) {
+  const pos = tour.curve.getPointAt( t );
+  const focus = tour.curve.getPointAt( Math.min( t + LOOK_AHEAD, 1 ) );
+  const up = pos.clone().normalize();
+  focus.addScaledVector( up, - LOOK_DOWN );
+  camera.position.copy( pos );
+  camera.up.copy( up );
+  camera.lookAt( focus );
+}
+
+function startTour() {
+  touring = true;
+  controls.enabled = false;
+  btnTour.classList.add( 'active' );
+}
+
+function stopTour() {
+  if ( ! touring ) return;
+  touring = false;
+  controls.enabled = true;
+  btnTour.classList.remove( 'active' );
+  waypointEl.style.opacity = 0;
+}
+
+function updateTour( dt ) {
+  tour.t = Math.min( tour.t + ( dt * TOUR_SPEED ) / tour.length, 1 );
+  placeCameraOnTour( tour.t );
+
+  // Fade the name of the landmark we're nearest to along the path.
+  let name = '';
+  for ( let i = 0; i < tour.fractions.length; i ++ ) {
+    if ( Math.abs( tour.t - tour.fractions[ i ] ) < 0.035 ) { name = tour.waypoints[ i ].name; break; }
+  }
+  waypointEl.textContent = name;
+  waypointEl.style.opacity = name ? 1 : 0;
+
+  if ( tour.t >= 1 ) { tour.t = 0; } // loop the lap
+}
+
+function animate() {
+  const now = performance.now();
+  const dt = Math.min( ( now - lastTime ) / 1000, 0.1 );
+  lastTime = now;
+
+  if ( touring && tour ) updateTour( dt );
+  controls.update();
+  camera.updateMatrixWorld();
+  tiles.update();
+  renderer.render( scene, camera );
+  updateStats();
+}
+
+const carto = {};
+function updateStats() {
+  try {
+    WGS84_ELLIPSOID.getPositionToCartographic( camera.position, carto );
+    const dl = tiles.stats ? `\ntiles downloading ${ tiles.stats.downloading }  ·  parsing ${ tiles.stats.parsing }` : '';
+    statsEl.textContent = `${ GeoUtils.toLatLonString( carto.lat, carto.lon ) }\nheight ${ Math.round( carto.height ) } m${ dl }`;
+  } catch ( e ) { /* position not on globe yet */ }
+}
+
+function updateCredits() {
+  try {
+    const attr = tiles.getAttributions().map( ( a ) => a.value ).filter( Boolean ).join( ' · ' );
+    if ( attr ) creditsEl.textContent = attr;
+  } catch ( e ) { /* tileset not ready */ }
+}
+
+let errorTimer;
+function showError( msg ) {
+  errorEl.textContent = msg;
+  errorEl.style.display = 'block';
+  clearTimeout( errorTimer );
+  errorTimer = setTimeout( () => { errorEl.style.display = 'none'; }, 12000 );
+}
+
+function begin( cityKey ) {
+  const key = keyInput.value.trim();
+  if ( ! key ) { keyInput.focus(); return; }
+  localStorage.setItem( 'g3d_api_key', key );
+  keyPanel.style.display = 'none';
+  hud.style.display = 'block';
+  help.style.display = 'block';
+  if ( ! renderer ) init( key );
+  goToCity( cityKey );
+}
+
+document.getElementById( 'startLondon' ).addEventListener( 'click', () => begin( 'london' ) );
+document.getElementById( 'startMonaco' ).addEventListener( 'click', () => begin( 'monaco' ) );
+document.getElementById( 'btnLondon' ).addEventListener( 'click', () => goToCity( 'london' ) );
+document.getElementById( 'btnMonaco' ).addEventListener( 'click', () => goToCity( 'monaco' ) );
+btnTour.addEventListener( 'click', () => {
+  if ( touring ) { stopTour(); }
+  else if ( tour ) { startTour(); }
+} );
+</script>
+</body>
+</html>
