@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>3D Maps Fly-Through — London &amp; Monaco</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #mapHost { position: fixed; inset: 0; }
+  #mapHost gmp-map-3d { width: 100%; height: 100%; }
+
+  .panel {
+    position: fixed; z-index: 10; color: #e8ecf5;
+    background: rgba(13, 18, 34, 0.82); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.10); border-radius: 14px;
+  }
+  #keyPanel {
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: min(440px, calc(100vw - 48px)); padding: 28px;
+  }
+  #keyPanel h1 { margin: 0 0 6px; font-size: 20px; }
+  #keyPanel p { margin: 8px 0; font-size: 13px; line-height: 1.55; color: #aeb8cc; }
+  #keyPanel a { color: #7fb4ff; }
+  #keyInput {
+    width: 100%; box-sizing: border-box; margin: 10px 0 12px; padding: 10px 12px;
+    font-size: 14px; color: #e8ecf5; background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.16); border-radius: 8px; outline: none;
+  }
+  #keyInput:focus { border-color: #7fb4ff; }
+  button {
+    cursor: pointer; font-size: 14px; font-weight: 600; color: #0b1020;
+    background: #7fb4ff; border: none; border-radius: 8px; padding: 10px 16px;
+  }
+  button:hover { background: #a4c9ff; }
+  button.secondary { background: rgba(255,255,255,0.10); color: #e8ecf5; }
+  button.secondary:hover { background: rgba(255,255,255,0.18); }
+  button.active { background: #ffd166; }
+
+  #hud { top: 16px; left: 16px; padding: 12px 14px; display: none; }
+  #hud .row { display: flex; gap: 8px; }
+  #waypointName {
+    position: fixed; z-index: 10; left: 50%; bottom: 72px; transform: translateX(-50%);
+    color: #fff; font-size: 22px; font-weight: 700; letter-spacing: 0.02em;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.8); pointer-events: none;
+    opacity: 0; transition: opacity 0.6s;
+  }
+  #help {
+    position: fixed; z-index: 10; left: 16px; bottom: 16px;
+    font-size: 11px; color: rgba(255,255,255,0.55); pointer-events: none; display: none;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
+</style>
+</head>
+<body>
+<div id="mapHost"></div>
+
+<div id="keyPanel" class="panel">
+  <h1>3D Maps Fly-Through</h1>
+  <p>The same London and Monaco tours as the tiles demo, but rendered by Google's own
+     <b>Photorealistic 3D Maps</b> web component (<code>Map3DElement</code>) instead of raw 3D Tiles in Three.js —
+     Google's renderer brings its own sky, atmosphere and camera choreography.</p>
+  <p>Needs a Google Maps Platform API key with the <b>Maps JavaScript API</b> enabled
+     (<a href="https://developers.google.com/maps/documentation/javascript/get-api-key" target="_blank" rel="noreferrer">how to get one</a>).
+     The key is kept in your browser's localStorage only.</p>
+  <input id="keyInput" type="password" placeholder="Paste your Google Maps API key" autocomplete="off" />
+  <div style="display:flex; gap:10px;">
+    <button id="startLondon">Fly London</button>
+    <button id="startMonaco">Fly Monaco</button>
+  </div>
+</div>
+
+<div id="hud" class="panel">
+  <div class="row">
+    <button id="btnLondon" class="secondary">London</button>
+    <button id="btnMonaco" class="secondary">Monaco</button>
+    <button id="btnTour" class="secondary">Tour</button>
+    <button id="btnLabels" class="secondary">Labels</button>
+  </div>
+</div>
+
+<div id="waypointName"></div>
+<div id="help">drag&nbsp;·&nbsp;rotate&nbsp;&nbsp;|&nbsp;&nbsp;ctrl-drag&nbsp;·&nbsp;tilt&nbsp;&nbsp;|&nbsp;&nbsp;scroll&nbsp;·&nbsp;zoom&nbsp;&nbsp;|&nbsp;&nbsp;interacting pauses the tour</div>
+
+<script>
+// Each stop is a look-at target: the camera orbits/tracks it from `range` meters at `tilt` degrees.
+// The final stop of each city gets a slow flyCameraAround orbit before the tour loops.
+const CITIES = {
+  london: [
+    { lat: 51.5055, lng: -0.0754, altitude: 30,  range: 700, tilt: 70, name: 'Tower Bridge' },
+    { lat: 51.5081, lng: -0.0761, altitude: 20,  range: 600, tilt: 68, name: 'Tower of London' },
+    { lat: 51.5045, lng: -0.0865, altitude: 180, range: 900, tilt: 60, name: 'The Shard' },
+    { lat: 51.5138, lng: -0.0984, altitude: 60,  range: 700, tilt: 65, name: "St Paul's Cathedral" },
+    { lat: 51.5033, lng: -0.1196, altitude: 60,  range: 650, tilt: 70, name: 'London Eye' },
+    { lat: 51.5007, lng: -0.1246, altitude: 50,  range: 550, tilt: 70, name: 'Big Ben & Parliament' },
+    { lat: 51.5014, lng: -0.1419, altitude: 20,  range: 750, tilt: 65, name: 'Buckingham Palace', orbit: true },
+  ],
+  monaco: [
+    { lat: 43.7314, lng: 7.4198, altitude: 70,  range: 800, tilt: 66, name: 'Le Rocher — Prince’s Palace' },
+    { lat: 43.7347, lng: 7.4206, altitude: 10,  range: 600, tilt: 70, name: 'Start/Finish — Blvd Albert 1er' },
+    { lat: 43.7372, lng: 7.4216, altitude: 20,  range: 500, tilt: 70, name: 'Sainte-Dévote' },
+    { lat: 43.7392, lng: 7.4277, altitude: 80,  range: 550, tilt: 68, name: 'Casino de Monte-Carlo' },
+    { lat: 43.7398, lng: 7.4287, altitude: 60,  range: 400, tilt: 72, name: 'Fairmont Hairpin' },
+    { lat: 43.7384, lng: 7.4306, altitude: 20,  range: 500, tilt: 70, name: 'Portier & the Tunnel' },
+    { lat: 43.7350, lng: 7.4268, altitude: 10,  range: 550, tilt: 70, name: 'Nouvelle Chicane & Piscine' },
+    { lat: 43.7334, lng: 7.4257, altitude: 15,  range: 450, tilt: 70, name: 'La Rascasse' },
+    { lat: 43.7347, lng: 7.4260, altitude: 20,  range: 1000, tilt: 62, name: 'Port Hercules', orbit: true },
+  ],
+};
+
+const keyPanel = document.getElementById('keyPanel');
+const keyInput = document.getElementById('keyInput');
+const hud = document.getElementById('hud');
+const help = document.getElementById('help');
+const waypointEl = document.getElementById('waypointName');
+const btnTour = document.getElementById('btnTour');
+const btnLabels = document.getElementById('btnLabels');
+
+const params = new URLSearchParams(location.search);
+keyInput.value = params.get('key') || localStorage.getItem('g3d_api_key') || '';
+
+let map = null;
+let MapModeEnum = null;
+let city = 'london';
+let legIndex = 0;
+let touring = false;
+let labelsOn = false;
+let loaderInjected = false;
+
+function bearing( a, b ) {
+  const φ1 = a.lat * Math.PI / 180, φ2 = b.lat * Math.PI / 180;
+  const Δλ = ( b.lng - a.lng ) * Math.PI / 180;
+  const y = Math.sin( Δλ ) * Math.cos( φ2 );
+  const x = Math.cos( φ1 ) * Math.sin( φ2 ) - Math.sin( φ1 ) * Math.cos( φ2 ) * Math.cos( Δλ );
+  return ( Math.atan2( y, x ) * 180 / Math.PI + 360 ) % 360;
+}
+
+function distanceMeters( a, b ) {
+  const R = 6371000;
+  const φ1 = a.lat * Math.PI / 180, φ2 = b.lat * Math.PI / 180;
+  const Δφ = φ2 - φ1, Δλ = ( b.lng - a.lng ) * Math.PI / 180;
+  const s = Math.sin( Δφ / 2 ) ** 2 + Math.cos( φ1 ) * Math.cos( φ2 ) * Math.sin( Δλ / 2 ) ** 2;
+  return 2 * R * Math.asin( Math.sqrt( s ) );
+}
+
+function cameraFor( stops, i ) {
+  const stop = stops[ i ];
+  const prev = stops[ ( i - 1 + stops.length ) % stops.length ];
+  return {
+    center: { lat: stop.lat, lng: stop.lng, altitude: stop.altitude },
+    range: stop.range,
+    tilt: stop.tilt,
+    heading: bearing( prev, stop ),
+  };
+}
+
+function injectLoader( key ) {
+  if ( loaderInjected ) return;
+  loaderInjected = true;
+  /* Official Maps JS API bootstrap loader */
+  (g=>{var h,a,k,p="The Google Maps JavaScript API",c="google",l="importLibrary",q="__ib__",m=document,b=window;b=b[c]||(b[c]={});var d=b.maps||(b.maps={}),r=new Set,e=new URLSearchParams,u=()=>h||(h=new Promise(async(f,n)=>{await (a=m.createElement("script"));e.set("libraries",[...r]+"");for(k in g)e.set(k.replace(/[A-Z]/g,t=>"_"+t[0].toLowerCase()),g[k]);e.set("callback",c+".maps."+q);a.src=`https://maps.${c}apis.com/maps/api/js?`+e;d[q]=f;a.onerror=()=>h=n(Error(p+" could not load."));a.nonce=m.querySelector("script[nonce]")?.nonce||"";m.head.append(a)}));d[l]?console.warn(p+" only loads once. Ignoring:",g):d[l]=(f,...n)=>r.add(f)&&u().then(()=>d[l](f,...n))})
+  ( { key, v: 'beta' } );
+}
+
+async function begin( cityKey ) {
+  const key = keyInput.value.trim();
+  if ( ! key ) { keyInput.focus(); return; }
+  localStorage.setItem( 'g3d_api_key', key );
+  injectLoader( key );
+
+  const { Map3DElement, MapMode } = await google.maps.importLibrary( 'maps3d' );
+  MapModeEnum = MapMode;
+
+  if ( ! map ) {
+    map = new Map3DElement( { mode: MapMode.SATELLITE, ...cameraFor( CITIES[ cityKey ], 0 ) } );
+    document.getElementById( 'mapHost' ).append( map );
+    map.addEventListener( 'gmp-animationend', onLegEnd );
+    // Any interaction hands control back to the user.
+    map.addEventListener( 'pointerdown', pauseTour, true );
+    map.addEventListener( 'wheel', pauseTour, { passive: true, capture: true } );
+  }
+
+  keyPanel.style.display = 'none';
+  hud.style.display = 'block';
+  help.style.display = 'block';
+  goToCity( cityKey );
+}
+
+function goToCity( cityKey ) {
+  city = cityKey;
+  legIndex = 0;
+  document.getElementById( 'btnLondon' ).classList.toggle( 'active', cityKey === 'london' );
+  document.getElementById( 'btnMonaco' ).classList.toggle( 'active', cityKey === 'monaco' );
+  resumeTour();
+}
+
+function flyLeg() {
+  const stops = CITIES[ city ];
+  const stop = stops[ legIndex ];
+  const cam = cameraFor( stops, legIndex );
+  const prev = stops[ ( legIndex - 1 + stops.length ) % stops.length ];
+  const durationMillis = Math.min( Math.max( distanceMeters( prev, stop ) / 70 * 1000, 4000 ), 14000 );
+
+  waypointEl.textContent = stop.name || '';
+  waypointEl.style.opacity = stop.name ? 1 : 0;
+
+  if ( stop.orbit ) {
+    map.flyCameraTo( { endCamera: cam, durationMillis } );
+    // After arriving, do a slow orbit of the final landmark, then loop the tour.
+    const onArrive = () => {
+      map.removeEventListener( 'gmp-animationend', onArrive );
+      if ( ! touring ) return;
+      map.flyCameraAround( { camera: cam, durationMillis: 22000, rounds: 1 } );
+      map.addEventListener( 'gmp-animationend', onOrbitDone, { once: true } );
+    };
+    map.removeEventListener( 'gmp-animationend', onLegEnd );
+    map.addEventListener( 'gmp-animationend', onArrive );
+  } else {
+    map.flyCameraTo( { endCamera: cam, durationMillis } );
+  }
+}
+
+function onLegEnd() {
+  if ( ! touring ) return;
+  legIndex = ( legIndex + 1 ) % CITIES[ city ].length;
+  flyLeg();
+}
+
+function onOrbitDone() {
+  map.addEventListener( 'gmp-animationend', onLegEnd );
+  if ( ! touring ) return;
+  legIndex = 0;
+  flyLeg();
+}
+
+function pauseTour() {
+  if ( ! touring ) return;
+  touring = false;
+  btnTour.classList.remove( 'active' );
+  waypointEl.style.opacity = 0;
+  map.stopCameraAnimation();
+}
+
+function resumeTour() {
+  touring = true;
+  btnTour.classList.add( 'active' );
+  flyLeg();
+}
+
+document.getElementById( 'startLondon' ).addEventListener( 'click', () => begin( 'london' ) );
+document.getElementById( 'startMonaco' ).addEventListener( 'click', () => begin( 'monaco' ) );
+document.getElementById( 'btnLondon' ).addEventListener( 'click', () => goToCity( 'london' ) );
+document.getElementById( 'btnMonaco' ).addEventListener( 'click', () => goToCity( 'monaco' ) );
+btnTour.addEventListener( 'click', () => { touring ? pauseTour() : resumeTour(); } );
+btnLabels.addEventListener( 'click', () => {
+  labelsOn = ! labelsOn;
+  btnLabels.classList.toggle( 'active', labelsOn );
+  if ( map && MapModeEnum ) map.mode = labelsOn ? MapModeEnum.HYBRID : MapModeEnum.SATELLITE;
+} );
+</script>
+</body>
+</html>
