@@ -205,9 +205,9 @@ function init( apiKey ) {
     showError( `Tile load error: ${ msg }. Check that the key is valid and the Map Tiles API is enabled for it.` );
   } );
 
-  controls = new GlobeControls( scene, camera, renderer.domElement, null );
+  controls = new GlobeControls( scene, camera, renderer.domElement );
   controls.enableDamping = true;
-  controls.setTilesRenderer( tiles );
+  controls.setEllipsoid( WGS84_ELLIPSOID, tiles.group );
 
   // Any interaction hands control back to the user.
   renderer.domElement.addEventListener( 'pointerdown', stopTour );
