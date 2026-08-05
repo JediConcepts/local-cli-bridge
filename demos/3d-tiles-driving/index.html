@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Monaco Drive — 3D Tiles</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #canvas { position: fixed; inset: 0; display: block; }
+
+  .panel {
+    position: fixed; z-index: 10; color: #e8ecf5;
+    background: rgba(13, 18, 34, 0.82); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.10); border-radius: 14px;
+  }
+  #keyPanel {
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: min(440px, calc(100vw - 48px)); padding: 28px;
+  }
+  #keyPanel h1 { margin: 0 0 6px; font-size: 20px; }
+  #keyPanel p { margin: 8px 0; font-size: 13px; line-height: 1.55; color: #aeb8cc; }
+  #keyPanel a { color: #7fb4ff; }
+  #keyInput {
+    width: 100%; box-sizing: border-box; margin: 10px 0 12px; padding: 10px 12px;
+    font-size: 14px; color: #e8ecf5; background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.16); border-radius: 8px; outline: none;
+  }
+  #keyInput:focus { border-color: #7fb4ff; }
+  button {
+    cursor: pointer; font-size: 14px; font-weight: 600; color: #0b1020;
+    background: #7fb4ff; border: none; border-radius: 8px; padding: 10px 16px;
+  }
+  button:hover { background: #a4c9ff; }
+
+  #hud {
+    top: 16px; left: 16px; padding: 12px 16px; display: none;
+    font-size: 13px; color: #aeb8cc; user-select: none; min-width: 210px;
+  }
+  #hud b { color: #fff; font-size: 22px; }
+  #speed { font-variant-numeric: tabular-nums; }
+  #lap, #next { margin-top: 4px; font-variant-numeric: tabular-nums; }
+  #next span { color: #ffd166; font-weight: 600; }
+
+  #loading {
+    position: fixed; z-index: 10; left: 50%; top: 40%; transform: translateX(-50%);
+    color: #fff; font-size: 16px; font-weight: 600; text-shadow: 0 2px 8px #000;
+    display: none; pointer-events: none;
+  }
+  #toast {
+    position: fixed; z-index: 10; left: 50%; bottom: 96px; transform: translateX(-50%);
+    color: #fff; font-size: 24px; font-weight: 800; letter-spacing: 0.02em;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.85); pointer-events: none;
+    opacity: 0; transition: opacity 0.5s;
+  }
+  #help {
+    position: fixed; z-index: 10; left: 16px; bottom: 16px; display: none;
+    font-size: 11px; color: rgba(255,255,255,0.55); pointer-events: none;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
+  #credits {
+    position: fixed; z-index: 10; right: 8px; bottom: 6px;
+    font-size: 10px; color: rgba(255,255,255,0.75);
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9); pointer-events: none;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.175.0/examples/jsm/",
+    "3d-tiles-renderer": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.5.0/build/index.js",
+    "3d-tiles-renderer/plugins": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.5.0/build/index.plugins.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="keyPanel" class="panel">
+  <h1>Monaco Drive</h1>
+  <p>An arcade car on the real streets of Monte Carlo, streamed live from Google's
+     <b>Photorealistic 3D Tiles</b>. The car raycasts against the photogrammetry mesh
+     every frame to stay on the road — the famous Grand Prix corners are checkpoints.</p>
+  <p>Needs the same Map Tiles API key as the fly-through demo.
+     <b>W/S</b> throttle &amp; brake, <b>A/D</b> steer, <b>C</b> camera, <b>R</b> reset to start line.</p>
+  <input id="keyInput" type="password" placeholder="Paste your Google Maps API key" autocomplete="off" />
+  <button id="startBtn">Drive Monaco</button>
+</div>
+
+<div id="hud" class="panel">
+  <div id="speed"><b>0</b> km/h</div>
+  <div id="lap">lap 0:00.0</div>
+  <div id="next">next: <span>—</span></div>
+</div>
+
+<div id="loading">Streaming Monaco… finding the road under the car</div>
+<div id="toast"></div>
+<div id="help">W/S throttle · A/D steer · C camera · R reset — no wall collisions in this prototype; the tunnel is a photogrammetry hill, drive over it!</div>
+<div id="credits">Map data ©Google</div>
+
+<script type="module">
+import {
+  Scene, WebGLRenderer, PerspectiveCamera, Vector3, MathUtils, Raycaster,
+  Group, Mesh, BoxGeometry, CylinderGeometry, TorusGeometry, MeshStandardMaterial,
+  AmbientLight, DirectionalLight, Matrix4, Quaternion
+} from 'three';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { TilesRenderer, WGS84_ELLIPSOID } from '3d-tiles-renderer';
+import {
+  GoogleCloudAuthPlugin, GLTFExtensionsPlugin, TileCompressionPlugin,
+  TilesFadePlugin, UnloadTilesPlugin
+} from '3d-tiles-renderer/plugins';
+
+// The lap: each checkpoint is a Grand Prix corner. The car spawns on the start/finish
+// straight. Heights are resolved at runtime by raycasting the streamed mesh.
+const START = { lat: 43.73460, lon: 7.42055 };
+const CHECKPOINTS = [
+  { lat: 43.73720, lon: 7.42160, name: 'Sainte-Dévote' },
+  { lat: 43.73860, lon: 7.42450, name: 'Beau Rivage' },
+  { lat: 43.73930, lon: 7.42770, name: 'Casino Square' },
+  { lat: 43.73980, lon: 7.42870, name: 'Fairmont Hairpin' },
+  { lat: 43.73840, lon: 7.43060, name: 'Portier' },
+  { lat: 43.73640, lon: 7.42930, name: 'Nouvelle Chicane' },
+  { lat: 43.73480, lon: 7.42690, name: 'Piscine' },
+  { lat: 43.73340, lon: 7.42570, name: 'La Rascasse' },
+  { lat: 43.73415, lon: 7.42040, name: 'Finish line' },
+];
+
+const MAX_SPEED = 38;        // m/s (~137 km/h)
+const ACCEL = 11;            // m/s^2
+const BRAKE = 22;
+const DRAG = 0.35;           // per-second fraction of speed
+const WHEELBASE = 2.6;       // m, for bicycle steering model
+const MAX_STEER = 0.55;      // rad at standstill, shrinks with speed
+const CLEARANCE = 0.8;       // m above the mesh
+const CHECKPOINT_RADIUS = 14;
+
+const keyPanel = document.getElementById('keyPanel');
+const keyInput = document.getElementById('keyInput');
+const hud = document.getElementById('hud');
+const help = document.getElementById('help');
+const speedEl = document.getElementById('speed');
+const lapEl = document.getElementById('lap');
+const nextEl = document.querySelector('#next span');
+const loadingEl = document.getElementById('loading');
+const toastEl = document.getElementById('toast');
+const creditsEl = document.getElementById('credits');
+
+const params = new URLSearchParams(location.search);
+keyInput.value = params.get('key') || localStorage.getItem('g3d_api_key') || '';
+
+let renderer, scene, camera, tiles, car, carBody;
+const keys = {};
+let lastTime = performance.now();
+
+// Car state lives in ECEF; the local east/north/up frame is recomputed every frame.
+const state = {
+  pos: new Vector3(), heading: 0, speed: 0,
+  grounded: false, lastGroundH: null, spawned: false,
+  checkpoint: 0, lapStart: 0, camMode: 0,
+};
+const up = new Vector3(), east = new Vector3(), north = new Vector3(), fwd = new Vector3();
+const raycaster = new Raycaster();
+raycaster.firstHitOnly = true;
+const tmpM = new Matrix4(), tmpQ = new Quaternion();
+const camTarget = new Vector3(), camPos = new Vector3(), lookPt = new Vector3();
+const rings = [];
+
+const Z_AXIS = new Vector3( 0, 0, 1 );
+function frameAt( pos ) {
+  up.copy( pos ).normalize();
+  east.crossVectors( Z_AXIS, up ).normalize();
+  north.crossVectors( up, east ).normalize();
+}
+
+function llToEcef( lat, lon, h, target ) {
+  return WGS84_ELLIPSOID.getCartographicToPosition( lat * MathUtils.DEG2RAD, lon * MathUtils.DEG2RAD, h, target );
+}
+
+function bearingDeg( a, b ) {
+  const φ1 = a.lat * Math.PI / 180, φ2 = b.lat * Math.PI / 180;
+  const Δλ = ( b.lon - a.lon ) * Math.PI / 180;
+  const y = Math.sin( Δλ ) * Math.cos( φ2 );
+  const x = Math.cos( φ1 ) * Math.sin( φ2 ) - Math.sin( φ1 ) * Math.cos( φ2 ) * Math.cos( Δλ );
+  return Math.atan2( y, x );
+}
+
+function buildCar() {
+  const g = new Group();
+  const paint = new MeshStandardMaterial( { color: 0xd7263d, roughness: 0.35, metalness: 0.4 } );
+  const dark = new MeshStandardMaterial( { color: 0x14161c, roughness: 0.8 } );
+  const body = new Mesh( new BoxGeometry( 1.9, 0.55, 4.4 ), paint );
+  body.position.y = 0.55;
+  const cabin = new Mesh( new BoxGeometry( 1.5, 0.45, 1.9 ), dark );
+  cabin.position.set( 0, 0.98, -0.15 );
+  g.add( body, cabin );
+  const wheelGeo = new CylinderGeometry( 0.36, 0.36, 0.3, 18 );
+  wheelGeo.rotateZ( Math.PI / 2 );
+  for ( const [ x, z ] of [ [ -0.85, 1.45 ], [ 0.85, 1.45 ], [ -0.85, -1.45 ], [ 0.85, -1.45 ] ] ) {
+    const w = new Mesh( wheelGeo, dark );
+    w.position.set( x, 0.36, z );
+    g.add( w );
+  }
+  return g;
+}
+
+function init( apiKey ) {
+  renderer = new WebGLRenderer( { canvas: document.getElementById( 'canvas' ), antialias: true, logarithmicDepthBuffer: true } );
+  renderer.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) );
+  renderer.setSize( window.innerWidth, window.innerHeight );
+  renderer.setClearColor( 0x87b7e8 );
+
+  scene = new Scene();
+  camera = new PerspectiveCamera( 65, window.innerWidth / window.innerHeight, 0.5, 1.6e8 );
+
+  // Google tiles are unlit; these lights only affect the car and rings.
+  scene.add( new AmbientLight( 0xffffff, 1.6 ) );
+  const sun = new DirectionalLight( 0xffffff, 2.2 );
+  sun.position.set( 0.5, 1, 0.3 );
+  scene.add( sun );
+
+  tiles = new TilesRenderer();
+  tiles.registerPlugin( new GoogleCloudAuthPlugin( { apiToken: apiKey, autoRefreshToken: true } ) );
+  tiles.registerPlugin( new TileCompressionPlugin() );
+  tiles.registerPlugin( new TilesFadePlugin() );
+  tiles.registerPlugin( new UnloadTilesPlugin() );
+  tiles.registerPlugin( new GLTFExtensionsPlugin( {
+    dracoLoader: new DRACOLoader().setDecoderPath( 'https://www.gstatic.com/draco/v1/decoders/' ),
+  } ) );
+  tiles.setCamera( camera );
+  tiles.setResolutionFromRenderer( camera, renderer );
+  tiles.errorTarget = 8;
+  scene.add( tiles.group );
+
+  car = buildCar();
+  car.visible = false;
+  scene.add( car );
+
+  // Checkpoint rings, ground-clamped lazily as their tiles stream in.
+  const ringGeo = new TorusGeometry( 7, 0.5, 12, 40 );
+  for ( let i = 0; i < CHECKPOINTS.length; i ++ ) {
+    const cp = CHECKPOINTS[ i ];
+    const mat = new MeshStandardMaterial( { color: 0xffd166, roughness: 0.4, transparent: true, opacity: 0.85 } );
+    const ring = new Mesh( ringGeo, mat );
+    ring.visible = false;
+    llToEcef( cp.lat, cp.lon, 120, ring.position );
+    scene.add( ring );
+    rings.push( { mesh: ring, placed: false, cp } );
+  }
+
+  // Spawn the car high above the start line; the ground raycast reels it in.
+  llToEcef( START.lat, START.lon, 150, state.pos );
+  state.heading = bearingDeg( START, CHECKPOINTS[ 0 ] );
+
+  window.addEventListener( 'keydown', ( e ) => {
+    keys[ e.key.toLowerCase() ] = true;
+    if ( e.key.toLowerCase() === 'c' ) state.camMode = ( state.camMode + 1 ) % 3;
+    if ( e.key.toLowerCase() === 'r' ) respawn();
+  } );
+  window.addEventListener( 'keyup', ( e ) => { keys[ e.key.toLowerCase() ] = false; } );
+  window.addEventListener( 'resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize( window.innerWidth, window.innerHeight );
+    tiles.setResolutionFromRenderer( camera, renderer );
+  } );
+
+  setInterval( () => {
+    try {
+      const attr = tiles.getAttributions().map( ( a ) => a.value ).filter( Boolean ).join( ' · ' );
+      if ( attr ) creditsEl.textContent = attr;
+    } catch ( e ) { /* tileset not ready */ }
+  }, 1000 );
+
+  loadingEl.style.display = 'block';
+  renderer.setAnimationLoop( animate );
+}
+
+function respawn() {
+  llToEcef( START.lat, START.lon, ( state.lastGroundH ?? 150 ) + 30, state.pos );
+  state.heading = bearingDeg( START, CHECKPOINTS[ 0 ] );
+  state.speed = 0;
+  state.checkpoint = 0;
+  state.lapStart = performance.now();
+}
+
+// Raycast straight down onto the streamed mesh; returns hit point or null.
+const rayOrigin = new Vector3(), hitPoint = new Vector3(), cartoScratch = {};
+function groundUnder( pos, from = 60, reach = 400 ) {
+  rayOrigin.copy( pos ).addScaledVector( up, from );
+  raycaster.set( rayOrigin, up.clone().negate() );
+  raycaster.far = reach;
+  const hits = raycaster.intersectObject( tiles.group, true );
+  return hits.length ? hitPoint.copy( hits[ 0 ].point ) : null;
+}
+
+function drive( dt ) {
+  frameAt( state.pos );
+
+  const throttle = ( keys[ 'w' ] || keys[ 'arrowup' ] ) ? 1 : 0;
+  const brake = ( keys[ 's' ] || keys[ 'arrowdown' ] ) ? 1 : 0;
+  const steerIn = ( ( keys[ 'a' ] || keys[ 'arrowleft' ] ) ? -1 : 0 ) + ( ( keys[ 'd' ] || keys[ 'arrowright' ] ) ? 1 : 0 );
+
+  state.speed += ( throttle * ACCEL - brake * BRAKE ) * dt;
+  state.speed -= state.speed * DRAG * dt;
+  state.speed = Math.max( 0, Math.min( state.speed, MAX_SPEED ) );
+
+  const steer = steerIn * MAX_STEER / ( 1 + state.speed / 12 );
+  if ( state.speed > 0.1 ) state.heading += ( state.speed / WHEELBASE ) * Math.tan( steer ) * dt;
+
+  fwd.copy( north ).multiplyScalar( Math.cos( state.heading ) ).addScaledVector( east, Math.sin( state.heading ) );
+  state.pos.addScaledVector( fwd, state.speed * dt );
+
+  const hit = groundUnder( state.pos, state.spawned ? 40 : 200, state.spawned ? 120 : 500 );
+  if ( hit ) {
+    const targetUpDist = hit.dot( up ) + CLEARANCE;
+    const curUpDist = state.pos.dot( up );
+    const blend = state.spawned ? 1 - Math.exp( -12 * dt ) : 1;
+    state.pos.addScaledVector( up, ( targetUpDist - curUpDist ) * blend );
+    state.grounded = true;
+    WGS84_ELLIPSOID.getPositionToCartographic( hit, cartoScratch );
+    state.lastGroundH = cartoScratch.height;
+    if ( ! state.spawned ) {
+      state.spawned = true;
+      car.visible = true;
+      loadingEl.style.display = 'none';
+      state.lapStart = performance.now();
+      toast( 'Lights out — drive to Sainte-Dévote!' );
+    }
+  } else {
+    state.grounded = false;
+  }
+
+  // Orient the car: forward along travel, up along the local vertical.
+  tmpM.lookAt( new Vector3(), fwd.clone().negate(), up );
+  tmpQ.setFromRotationMatrix( tmpM );
+  car.position.copy( state.pos );
+  car.quaternion.copy( tmpQ );
+}
+
+function placeRings() {
+  for ( const r of rings ) {
+    if ( r.placed ) continue;
+    if ( r.mesh.position.distanceTo( state.pos ) > 600 ) continue;
+    frameAt( r.mesh.position );
+    const hit = groundUnder( r.mesh.position, 200, 500 );
+    if ( hit ) {
+      r.mesh.position.copy( hit ).addScaledVector( up, 6 );
+      const outward = r.mesh.position.clone().normalize();
+      tmpM.lookAt( new Vector3(), east, outward ); // stand the ring upright
+      r.mesh.quaternion.setFromRotationMatrix( tmpM );
+      r.mesh.visible = true;
+      r.placed = true;
+    }
+  }
+  frameAt( state.pos );
+}
+
+function checkCheckpoints() {
+  if ( ! state.spawned || state.checkpoint >= CHECKPOINTS.length ) return;
+  const target = rings[ state.checkpoint ];
+  const d = target.mesh.position.distanceTo( state.pos );
+  if ( target.placed && d < CHECKPOINT_RADIUS ) {
+    target.mesh.material.color.set( 0x4caf50 );
+    target.mesh.material.opacity = 0.35;
+    state.checkpoint ++;
+    if ( state.checkpoint === CHECKPOINTS.length ) {
+      const t = ( performance.now() - state.lapStart ) / 1000;
+      toast( `Lap complete — ${ fmtTime( t ) }! Press R to go again.` );
+    } else {
+      toast( CHECKPOINTS[ state.checkpoint - 1 ].name );
+    }
+  }
+}
+
+function updateCamera( dt ) {
+  const modes = [ { back: 16, upM: 7, look: 8 }, { back: 8, upM: 3, look: 5 }, { back: 0.2, upM: 1.6, look: 30 } ];
+  const m = modes[ state.camMode ];
+  camPos.copy( state.pos ).addScaledVector( fwd, -m.back ).addScaledVector( up, m.upM );
+  const blend = state.spawned ? 1 - Math.exp( -5 * dt ) : 1;
+  camTarget.lerp( camPos, blend );
+  camera.position.copy( camTarget );
+  camera.up.copy( up );
+  lookPt.copy( state.pos ).addScaledVector( fwd, m.look ).addScaledVector( up, 1.5 );
+  camera.lookAt( lookPt );
+}
+
+let toastTimer;
+function toast( msg ) {
+  toastEl.textContent = msg;
+  toastEl.style.opacity = 1;
+  clearTimeout( toastTimer );
+  toastTimer = setTimeout( () => { toastEl.style.opacity = 0; }, 3200 );
+}
+
+function fmtTime( s ) {
+  return `${ Math.floor( s / 60 ) }:${ ( s % 60 ).toFixed( 1 ).padStart( 4, '0' ) }`;
+}
+
+function animate() {
+  const now = performance.now();
+  const dt = Math.min( ( now - lastTime ) / 1000, 0.05 );
+  lastTime = now;
+
+  drive( dt );
+  placeRings();
+  checkCheckpoints();
+  updateCamera( dt );
+
+  camera.updateMatrixWorld();
+  tiles.update();
+  renderer.render( scene, camera );
+
+  speedEl.innerHTML = `<b>${ Math.round( state.speed * 3.6 ) }</b> km/h`;
+  if ( state.spawned && state.checkpoint < CHECKPOINTS.length ) {
+    lapEl.textContent = `lap ${ fmtTime( ( now - state.lapStart ) / 1000 ) }`;
+    nextEl.textContent = CHECKPOINTS[ state.checkpoint ].name;
+  }
+
+  WGS84_ELLIPSOID.getPositionToCartographic( state.pos, cartoScratch );
+  window.__drive = {
+    speed: state.speed, grounded: state.grounded, spawned: state.spawned, checkpoint: state.checkpoint,
+    lat: cartoScratch.lat * MathUtils.RAD2DEG, lon: cartoScratch.lon * MathUtils.RAD2DEG, height: cartoScratch.height,
+  };
+}
+
+// Dev helper: sample the streamed mesh height at a lat/lon (null until tiles cover it).
+const probeVec = new Vector3();
+window.__probe = ( lat, lon ) => {
+  llToEcef( lat, lon, 800, probeVec );
+  frameAt( probeVec );
+  const hit = groundUnder( probeVec, 0, 1600 );
+  if ( ! hit ) { frameAt( state.pos ); return null; }
+  WGS84_ELLIPSOID.getPositionToCartographic( hit, cartoScratch );
+  frameAt( state.pos );
+  return Math.round( cartoScratch.height * 10 ) / 10;
+};
+
+document.getElementById( 'startBtn' ).addEventListener( 'click', () => {
+  const key = keyInput.value.trim();
+  if ( ! key ) { keyInput.focus(); return; }
+  localStorage.setItem( 'g3d_api_key', key );
+  keyPanel.style.display = 'none';
+  hud.style.display = 'block';
+  help.style.display = 'block';
+  init( key );
+} );
+</script>
+</body>
+</html>
