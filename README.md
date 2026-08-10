@@ -52,6 +52,8 @@ rest loudly** (400 with the feature named) instead of silently ignoring it:
 | `n > 1` | ❌ 400 | exactly one choice |
 | `temperature`, `top_p`, `max_tokens`, … | accepted, ignored | the CLIs take no equivalent |
 | `usage` token counts | estimated | ~4 chars/token, not provider-reported |
+| `POST /v1/embeddings` | ✅ (extension) | proxied to a local Ollama — the CLIs cannot embed |
+| `POST /api/embeddings`, `/api/pull` | ✅ (extension) | Ollama's native shape, for clients pointing `OLLAMA_BASE_URL` here |
 
 ## Quick start
 
@@ -163,6 +165,8 @@ The tunnel launcher **fails closed**, it refuses to start without `BRIDGE_API_KE
 | `BRIDGE_TIMEOUT_MS` | `900000` | per-request CLI timeout; on expiry the child is killed and the request fails `504` |
 | `BRIDGE_MAX_CONCURRENT` | `4` | ceiling on live CLI child processes (excess → 429) |
 | `BRIDGE_LOG_TIME` | `human` | timestamp prefix on log lines: `human` (`YYYY-MM-DD HH:MM:SS.mmm`, local), `iso` (UTC, matches a caller's audit record `timestamp`), or `off` for supervisors that stamp their own |
+| `BRIDGE_OLLAMA_URL` | `http://127.0.0.1:11434` | where the embeddings proxy forwards |
+| `BRIDGE_EMBED_MODEL` | `nomic-embed-text` | model for `/v1/embeddings` requests that omit one |
 | `BRIDGE_MAX_BODY_BYTES` | 10 MB | request body ceiling (413 above it) |
 | `BRIDGE_MAX_PROCESS_OUTPUT_BYTES` | 10 MB | ceiling on total child output — stdout + stderr + result file (502 above it) |
 | `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat: `auto` heartbeats only tunnel-forwarded requests, local calls keep real status codes; `0` never, `N` ms always |
