@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **Embeddings proxy.** The CLI backends cannot embed — neither Claude Code nor Codex
+  has an embeddings mode — so `/v1/embeddings` (OpenAI shape) and `/api/embeddings` +
+  `/api/pull` (Ollama's native shape) forward to a local Ollama at
+  `BRIDGE_OLLAMA_URL`. That lets **one tunnelled surface carry both chat and
+  embeddings**, instead of standing up a second tunnel for the second shape: a client
+  points `OLLAMA_BASE_URL` at the bridge and authenticates with `OLLAMA_API_KEY` set
+  to the bridge key.
+
+  Upstreamed from a vendored fork that had carried it privately. Keeping it there
+  meant a copy of the whole bridge drifting out of sync — the fork was 590 lines
+  against 969 here, and had missed every hardening change in between.
+
+  Same auth, same `BRIDGE_MAX_BODY_BYTES` ceiling and same error shape as the chat
+  route, so embeddings cannot bypass a limit chat respects. An unreachable Ollama
+  returns a 502 that **names the URL it tried** and the setting that changes it —
+  "is Ollama even running?" is always the first question. Token counts are reported
+  as `0` rather than estimated: Ollama returns none, and an obviously absent number
+  beats a fabricated one.
+
+  New: `BRIDGE_OLLAMA_URL`, `BRIDGE_EMBED_MODEL`.
+
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (0.x: minor bumps may change behavior).

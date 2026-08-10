@@ -108,6 +108,13 @@ const AUTO_KEEPALIVE_MS = 20_000;
 // Request body ceiling, matches the Claude CLI's 10MB stdin cap; a caller (or stolen
 // token) can't exhaust memory with an unbounded body.
 const MAX_BODY_BYTES = positiveInteger(process.env.BRIDGE_MAX_BODY_BYTES, 10 * 1024 * 1024);
+
+// Embeddings proxy target. The CLI backends cannot embed — Claude Code and Codex
+// have no embeddings mode — but a local Ollama can, so the bridge forwards these
+// routes rather than pretending to serve them. That lets ONE tunnelled surface
+// carry both chat and embeddings, instead of a second tunnel for the second shape.
+const OLLAMA_URL = (process.env.BRIDGE_OLLAMA_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+const EMBED_MODEL = process.env.BRIDGE_EMBED_MODEL || "nomic-embed-text";
 // Ceiling on TOTAL child process output — stdout + stderr + the Codex result
 // file — counted in raw bytes before decoding. Deliberately named "process
 // output": agent chatter and stderr logging count against it, not just the
@@ -909,6 +916,47 @@ function handleRequest(req, res) {
     return;
   }
 
+  // ── Embeddings proxy (→ local Ollama) ──────────────────────────────────────
+  // `/api/embeddings` and `/api/pull` speak Ollama's native shape, which is what a
+  // client sends when its OLLAMA_BASE_URL points here (authenticating with
+  // OLLAMA_API_KEY set to this bridge's BRIDGE_API_KEY). `/v1/embeddings` speaks the
+  // OpenAI shape for anything else. Both are proxies: the bridge adds auth, a
+  // timeout and a named error, and otherwise gets out of the way.
+  if (req.method === "POST" && (url === "/api/embeddings" || url === "/api/pull")) {
+    if (!authOk(req)) return send(res, 401, { error: { message: "Unauthorized" } });
+    return readJsonBody(req, res, async (body) => {
+      // A pull downloads a model and can take minutes; an embed is sub-second.
+      const timeoutMs = url === "/api/pull" ? TIMEOUT_MS : 60_000;
+      const upstream = await ollamaFetch(url, body, timeoutMs);
+      if (!upstream.ok && upstream.unreachable) {
+        return send(res, 502, { error: { message: upstream.message, type: "bridge_ollama_unreachable" } });
+      }
+      return send(res, upstream.status, upstream.body);
+    });
+  }
+
+  if (req.method === "POST" && (url === "/v1/embeddings" || url === "/embeddings")) {
+    if (!authOk(req)) return send(res, 401, { error: { message: "Unauthorized" } });
+    return readJsonBody(req, res, async (body) => {
+      const model = body.model || EMBED_MODEL;
+      const inputs = Array.isArray(body.input) ? body.input : [body.input ?? ""];
+      const data = [];
+      for (let i = 0; i < inputs.length; i++) {
+        const upstream = await ollamaFetch("/api/embeddings", { model, prompt: String(inputs[i]) }, 60_000);
+        if (!upstream.ok) {
+          const message = upstream.unreachable
+            ? upstream.message
+            : `Ollama ${upstream.status}: ${JSON.stringify(upstream.body).slice(0, 200)}`;
+          return send(res, 502, { error: { message, type: "bridge_ollama_error" } });
+        }
+        data.push({ object: "embedding", index: i, embedding: upstream.body?.embedding ?? [] });
+      }
+      // Token counts are reported as 0 rather than estimated: Ollama does not return
+      // them, and a fabricated number is worse than an obviously absent one.
+      return send(res, 200, { object: "list", model, data, usage: { prompt_tokens: 0, total_tokens: 0 } });
+    });
+  }
+
   send(res, 404, { error: { message: `No route for ${req.method} ${url}` } });
 }
 
@@ -951,10 +999,15 @@ if (IS_MAIN) {
     throw err;
   });
 
-  server.listen(PORT, HOST, () => {
+server.listen(PORT, HOST, () => {
     log.info(`local-cli-bridge listening on http://${HOST}:${PORT}`);
     log.info(`backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
     log.info(`OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
+  log.info(`embeddings proxy → ${OLLAMA_URL} (default embed model ${EMBED_MODEL})`);
+  log.info(
+    `for embeddings, point OLLAMA_BASE_URL at http://${HOST}:${PORT}` +
+      (REQUIRE_KEY ? " and set OLLAMA_API_KEY to the bridge key" : ""),
+  );
   });
 
   // Graceful shutdown: stop accepting connections, let in-flight completions drain
@@ -966,5 +1019,80 @@ if (IS_MAIN) {
       // Hard exit if a long completion holds the server open past a grace period.
       setTimeout(() => process.exit(0), 5_000).unref();
     });
+  }
+}
+
+/**
+ * Collect a JSON request body, then run the async handler.
+ *
+ * Malformed JSON → 400, an oversized body → 413 before it is buffered, a thrown
+ * handler → 502. Same contract and the same MAX_BODY_BYTES ceiling as the chat
+ * route, so an embeddings caller cannot bypass a limit the chat caller respects.
+ */
+function readJsonBody(req, res, handler) {
+  let raw = "";
+  let bytes = 0;
+  let aborted = false;
+  req.on("data", (d) => {
+    if (aborted) return;
+    bytes += d.length;
+    if (bytes > MAX_BODY_BYTES) {
+      aborted = true;
+      send(res, 413, { error: { message: `Request body exceeds ${MAX_BODY_BYTES} bytes` } });
+      req.destroy();
+      return;
+    }
+    raw += d;
+  });
+  req.on("end", async () => {
+    if (aborted) return;
+    let body;
+    try {
+      body = JSON.parse(raw || "{}");
+    } catch {
+      return send(res, 400, { error: { message: "Invalid JSON body" } });
+    }
+    try {
+      await handler(body);
+    } catch (e) {
+      log.error(`embeddings error: ${e.message}`);
+      if (!res.writableEnded) {
+        send(res, 502, { error: { message: e.message, type: "bridge_embeddings_error" } });
+      }
+    }
+  });
+}
+
+/**
+ * POST to the local Ollama.
+ *
+ * Returns `{ ok, status, body }` for any HTTP response, and
+ * `{ ok: false, unreachable: true, message }` when Ollama cannot be reached at all —
+ * so the 502 that reaches the caller NAMES the target URL rather than failing mutely.
+ * "Is Ollama even running?" is the first question every time, and the error answers it.
+ */
+async function ollamaFetch(pathname, body, timeoutMs) {
+  const target = `${OLLAMA_URL}${pathname}`;
+  try {
+    const r = await fetch(target, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await r.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { raw: text.slice(0, 500) };
+    }
+    return { ok: r.ok, status: r.status, body: parsed };
+  } catch (e) {
+    return {
+      ok: false,
+      unreachable: true,
+      message: `Ollama unreachable at ${target} (${e.message}) — is Ollama running? Set BRIDGE_OLLAMA_URL if it listens elsewhere.`,
+    };
   }
 }
