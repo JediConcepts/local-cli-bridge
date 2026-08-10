@@ -47,6 +47,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
+import { log } from "./lib/log.mjs";
 
 // Pull BRIDGE_* config from .env.bridge.local / .env.local (allowlisted) before reading it.
 loadBridgeEnv();
@@ -63,17 +64,17 @@ const cloudflaredBin = process.env.CLOUDFLARED_BIN || "cloudflared";
 const expandTilde = (p) => (p && p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p);
 
 if (!tunnelName) {
-  console.error("[bridge:tunnel] BRIDGE_TUNNEL_NAME is required (the dedicated Cloudflare tunnel to run).");
-  console.error("[bridge:tunnel] Already run cloudflared for another hostname? Use `npm run bridge` instead,");
-  console.error("[bridge:tunnel] see Arrangement A in docs/REMOTE_BRIDGE.md.");
+  log.error("[bridge:tunnel] BRIDGE_TUNNEL_NAME is required (the dedicated Cloudflare tunnel to run).");
+  log.error("[bridge:tunnel] Already run cloudflared for another hostname? Use `npm run bridge` instead,");
+  log.error("[bridge:tunnel] see Arrangement A in docs/REMOTE_BRIDGE.md.");
   process.exit(1);
 }
 if (!process.env.BRIDGE_API_KEY) {
   // Fail CLOSED: exposing an unkeyed bridge through a tunnel means anyone who clears
   // (or misconfigures) Cloudflare Access gets an open door to the CLIs. A key-less
   // bridge is allowed only for explicitly-local use via `npm run bridge`.
-  console.error("[bridge:tunnel] BRIDGE_API_KEY is required when exposing the bridge through a tunnel.");
-  console.error("[bridge:tunnel] Set a strong random Bearer key, or run `npm run bridge` for loopback-only use.");
+  log.error("[bridge:tunnel] BRIDGE_API_KEY is required when exposing the bridge through a tunnel.");
+  log.error("[bridge:tunnel] Set a strong random Bearer key, or run `npm run bridge` for loopback-only use.");
   process.exit(1);
 }
 
@@ -87,12 +88,12 @@ function start(label, cmd, cmdArgs, extraEnv) {
   child.stderr.on("data", (d) => process.stderr.write(prefix(d.toString()) + "\n"));
   child.on("exit", (code, signal) => {
     if (shuttingDown) return;
-    console.error(`[bridge:tunnel] ${label} exited (code=${code} signal=${signal}), shutting down the other process.`);
+    log.error(`[bridge:tunnel] ${label} exited (code=${code} signal=${signal}), shutting down the other process.`);
     shutdown(code ?? 1);
   });
   child.on("error", (err) => {
-    console.error(`[bridge:tunnel] failed to start ${label}: ${err.message}`);
-    if (label === "cloudflared") console.error("[bridge:tunnel]   Is cloudflared installed and on PATH? https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/");
+    log.error(`[bridge:tunnel] failed to start ${label}: ${err.message}`);
+    if (label === "cloudflared") log.error("[bridge:tunnel]   Is cloudflared installed and on PATH? https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/");
     shutdown(1);
   });
   children.push(child);
@@ -111,7 +112,7 @@ function shutdown(code) {
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 
-console.log(`[bridge:tunnel] starting bridge on 127.0.0.1:${port} (backend=${backend}) + tunnel "${tunnelName}"`);
+log.info(`[bridge:tunnel] starting bridge on 127.0.0.1:${port} (backend=${backend}) + tunnel "${tunnelName}"`);
 
 // 1. Bridge, always loopback, with the advertised models. BRIDGE_API_KEY passes through.
 //    Keepalive defaults to "auto" (not a forced interval): the bridge heartbeats

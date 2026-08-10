@@ -71,6 +71,7 @@ single custom endpoint in your application and pick the model per request. Set
 | `BRIDGE_MAX_BODY_BYTES` | `10485760` | request body ceiling (10 MB, the CLI stdin cap); excess → 413 |
 | `BRIDGE_MAX_PROCESS_OUTPUT_BYTES` | `10485760` | ceiling on **total child process output** — stdout + stderr + the Codex result file, agent chatter included, not just the model answer. On breach the child is killed and the request fails `502` |
 | `BRIDGE_MAX_CONCURRENT` | `4` | ceiling on live CLI child processes; excess → 429. Held until a child actually exits — including one that is being killed after its client disconnected — so it can never be exceeded during cancellation. Single-user operators can lower it |
+| `BRIDGE_LOG_TIME` | `human` | timestamp prefix on log lines: `human` (`YYYY-MM-DD HH:MM:SS.mmm`, local), `iso` (UTC, matches a caller's audit record `timestamp`), or `off` for supervisors that stamp their own |
 | `BRIDGE_EXPOSE_ERROR_DETAILS` | `0` | `1` returns raw backend error messages to the client (they can reveal executable names, paths, and login state), set it only on a trusted local deployment; the default returns a generic message + correlation id, with full detail in the server log |
 | `BRIDGE_ALLOW_QUERY_KEY` | `0` | `1` enables `GET /v1/models?key=<BRIDGE_API_KEY>` for browser viewing through the tunnel (key lands in history/logs, opt-in) |
 | `BRIDGE_TRUST_CF_ACCESS` | `0` | `1` lets requests that passed Cloudflare Access (edge-stamped `Cf-Access-Jwt-Assertion`) view GET discovery routes. Only sound while Access covers the hostname |

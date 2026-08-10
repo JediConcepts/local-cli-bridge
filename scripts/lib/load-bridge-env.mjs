@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { log } from "./log.mjs";
 
 // Only these keys are ever imported from the file. Everything else in it is ignored.
 const ALLOW = /^BRIDGE_[A-Z0-9_]*$|^CLOUDFLARED_BIN$/;
@@ -55,7 +56,7 @@ export function loadBridgeEnv() {
     applied++;
   }
   if (applied > 0) {
-    console.log(`[bridge] loaded ${applied} setting(s) from ${path.basename(file)}` +
+    log.info(`loaded ${applied} setting(s) from ${path.basename(file)}` +
       (skipped ? ` (ignored ${skipped} non-BRIDGE_ key(s))` : ""));
   }
   return { file: path.basename(file), applied };
