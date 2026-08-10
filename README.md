@@ -162,6 +162,7 @@ The tunnel launcher **fails closed**, it refuses to start without `BRIDGE_API_KE
 | `BRIDGE_API_KEY` | — | Bearer key callers must send |
 | `BRIDGE_TIMEOUT_MS` | `900000` | per-request CLI timeout; on expiry the child is killed and the request fails `504` |
 | `BRIDGE_MAX_CONCURRENT` | `4` | ceiling on live CLI child processes (excess → 429) |
+| `BRIDGE_LOG_TIME` | `human` | timestamp prefix on log lines: `human` (`YYYY-MM-DD HH:MM:SS.mmm`, local), `iso` (UTC, matches a caller's audit record `timestamp`), or `off` for supervisors that stamp their own |
 | `BRIDGE_MAX_BODY_BYTES` | 10 MB | request body ceiling (413 above it) |
 | `BRIDGE_MAX_PROCESS_OUTPUT_BYTES` | 10 MB | ceiling on total child output — stdout + stderr + result file (502 above it) |
 | `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat: `auto` heartbeats only tunnel-forwarded requests, local calls keep real status codes; `0` never, `N` ms always |

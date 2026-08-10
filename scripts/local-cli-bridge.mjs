@@ -70,6 +70,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { loadBridgeEnv } from "./lib/load-bridge-env.mjs";
 import { argsFromEnv } from "./lib/parse-argv.mjs";
+import { log } from "./lib/log.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -169,7 +170,7 @@ const MODEL_CAPS_DEFAULTS = (() => {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     return (parsed.defaults || []).map((e) => [new RegExp(e.match, "i"), e.context_window, e.max_output_tokens]);
   } catch (e) {
-    console.warn(`[bridge] could not load model capability defaults (${file}): ${e.message}; models will report caps_source "unknown"`);
+    log.warn(`could not load model capability defaults (${file}): ${e.message}; models will report caps_source "unknown"`);
     return [];
   }
 })();
@@ -835,7 +836,7 @@ function handleRequest(req, res) {
       const keepaliveMs = keepaliveMsFor(req);
       if (KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
         warnedKeepaliveOffOnTunnel = true;
-        console.warn("[bridge] tunnel-forwarded request with the keepalive disabled: responses slower than ~100s will die with a Cloudflare 524 (set BRIDGE_KEEPALIVE_MS=auto)");
+        log.warn("tunnel-forwarded request with the keepalive disabled: responses slower than ~100s will die with a Cloudflare 524 (set BRIDGE_KEEPALIVE_MS=auto)");
       }
       if (keepaliveMs > 0) {
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -868,8 +869,8 @@ function handleRequest(req, res) {
           { model: body.model, system, prompt },
           { signal: ac.signal },
         );
-        console.log(
-          `[bridge] ${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""} → ${text.length} chars in ${Date.now() - t0}ms`,
+        log.info(
+          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""} → ${text.length} chars in ${Date.now() - t0}ms`,
         );
         return finish(
           200,
@@ -883,7 +884,7 @@ function handleRequest(req, res) {
       } catch (e) {
         if (e.code === "CLIENT_DISCONNECTED") {
           // The socket is gone, there is nobody to answer; just record it.
-          console.log(`[bridge] client disconnected after ${Date.now() - t0}ms, ${resolveBackendName(body.model)} child terminated`);
+          log.info(`client disconnected after ${Date.now() - t0}ms, ${resolveBackendName(body.model)} child terminated`);
           return;
         }
         // Full detail always lands in the SERVER log with a correlation id; whether the
@@ -892,7 +893,7 @@ function handleRequest(req, res) {
         // default) — except BridgeErrors marked safeToExpose, which reveal nothing
         // about the host and stay actionable for remote callers.
         const errorId = crypto.randomUUID();
-        console.error(`[bridge] error ${errorId}: ${e.stack || e.message}`);
+        log.error(`error ${errorId}: ${e.stack || e.message}`);
         const message = EXPOSE_ERROR_DETAILS || e.safeToExpose ? e.message : "The local model backend failed";
         // A timed-out backend is a gateway timeout; every other backend failure
         // (spawn, non-zero exit, parse) is a bad gateway. With the keepalive
@@ -939,28 +940,28 @@ if (IS_MAIN) {
   // (something else, often another bridge, already owns the port).
   server.on("error", (err) => {
     if (err.code === "EADDRINUSE") {
-      console.error(`[bridge] port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
-      console.error(`[bridge] pick another port:  PORT=8790 npx local-cli-bridge`);
+      log.error(`port ${PORT} on ${HOST} is already in use (another bridge or service?).`);
+      log.error(`pick another port:  PORT=8790 npx local-cli-bridge`);
       process.exit(1);
     }
     if (err.code === "EACCES") {
-      console.error(`[bridge] no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
+      log.error(`no permission to bind ${HOST}:${PORT}. Ports below 1024 need elevated rights.`);
       process.exit(1);
     }
     throw err;
   });
 
   server.listen(PORT, HOST, () => {
-    console.log(`[bridge] local-cli-bridge listening on http://${HOST}:${PORT}`);
-    console.log(`[bridge] backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
-    console.log(`[bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
+    log.info(`local-cli-bridge listening on http://${HOST}:${PORT}`);
+    log.info(`backend=${BACKEND}  default-model=${DEFAULT_MODEL || "(request-supplied)"}  max-concurrent=${MAX_CONCURRENT}`);
+    log.info(`OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
   });
 
   // Graceful shutdown: stop accepting connections, let in-flight completions drain
   // (their CLI children are killed by the runner's own timeout at worst).
   for (const sig of ["SIGINT", "SIGTERM"]) {
     process.on(sig, () => {
-      console.log(`[bridge] ${sig}, shutting down`);
+      log.info(`${sig}, shutting down`);
       server.close(() => process.exit(0));
       // Hard exit if a long completion holds the server open past a grace period.
       setTimeout(() => process.exit(0), 5_000).unref();
