@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`docs/RUNNING_AS_A_SERVICE.md`.** Running the bridge under launchd, `systemd --user`,
+  and Windows Task Scheduler. The foreground quick start is fine for a trial, but the
+  tunnel setup this project exists for needs an origin that survives a closed terminal.
+  Covers the three things that make service managers fail where a shell succeeds: the env
+  file binds to the script's location (not the cwd), services inherit no `PATH` and so
+  cannot find the backend CLI, and hardcoding a version-manager Node path breaks on the
+  next upgrade.
+- Troubleshooting rows for those service failure modes, and for Codex 400s caused by a
+  global `model_reasoning_effort` in `~/.codex/config.toml` that the requested model does
+  not support.
+
+### Changed
+
+- **A missing env file now warns instead of returning silently.** `loadBridgeEnv()` fell
+  through to the built-in defaults without a word, so a bridge pointed at the wrong
+  checkout would start clean, log a healthy banner, and serve `backend=claude` with only
+  `opus,sonnet,haiku` — indistinguishable from a working deployment until someone asked
+  why their models were missing. It now names the paths it tried. A file that exists but
+  applies nothing (every key already set inline, or no `BRIDGE_*` keys at all) says which
+  of the two it was.
+
 ## 0.3.0
 
 ### Added

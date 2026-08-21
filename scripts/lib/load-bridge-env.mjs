@@ -45,7 +45,20 @@ export function loadBridgeEnv() {
     : [path.join(repoRoot, ".env.bridge.local"), path.join(repoRoot, ".env.local")];
 
   const file = candidates.find((f) => f && fs.existsSync(f));
-  if (!file) return null;
+  if (!file) {
+    // Loudly, because the failure is otherwise invisible: the bridge starts fine and
+    // serves the DEFAULT backend and model list, so a misconfigured deployment looks
+    // healthy in the log and only shows up as "why is my model missing?" later. The
+    // usual cause is launching a different copy of the script (these paths resolve from
+    // the script's own location, NOT the cwd) or a service manager whose working
+    // directory points elsewhere.
+    log.warn(
+      `no env file found, using built-in defaults \u2014 looked for: ${candidates.join(", ")}` +
+      (process.env.BRIDGE_ENV_FILE ? " (from BRIDGE_ENV_FILE)" : "") +
+      "; set BRIDGE_ENV_FILE=<path> to point at one explicitly",
+    );
+    return null;
+  }
 
   let applied = 0;
   let skipped = 0;
@@ -58,6 +71,13 @@ export function loadBridgeEnv() {
   if (applied > 0) {
     log.info(`loaded ${applied} setting(s) from ${path.basename(file)}` +
       (skipped ? ` (ignored ${skipped} non-BRIDGE_ key(s))` : ""));
+  } else {
+    // The file exists but changed nothing. Benign when every value is already set
+    // inline (inline env wins by design), misleading otherwise, so say which it is.
+    log.warn(
+      `${path.basename(file)} applied 0 setting(s)` +
+      (skipped ? ` (all ${skipped} key(s) ignored: not BRIDGE_*)` : " (every key already set in the environment)"),
+    );
   }
   return { file: path.basename(file), applied };
 }
