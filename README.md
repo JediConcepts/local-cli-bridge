@@ -128,6 +128,10 @@ Config can live in a file instead of the shell: the bridge auto-loads `.env.brid
 `.env.local` (only `BRIDGE_*` keys are read). Copy [`.env.example`](./.env.example) to get
 started.
 
+That runs it in the foreground, which stops when the terminal does. To keep it up across
+logins and crashes — necessary if you expose it through a tunnel — see
+[`docs/RUNNING_AS_A_SERVICE.md`](./docs/RUNNING_AS_A_SERVICE.md).
+
 ### 4. Verify
 
 ```bash
@@ -218,6 +222,7 @@ Full layer-by-layer failure table and the "Not logged in" flow:
 - **`README.md`** (this file), what it is + quick start.
 - **[`docs/LOCAL_BRIDGE.md`](./docs/LOCAL_BRIDGE.md)**, local run + full config/env reference.
 - **[`docs/REMOTE_BRIDGE.md`](./docs/REMOTE_BRIDGE.md)**, Cloudflare Tunnel + Access walkthrough and security model.
+- **[`docs/RUNNING_AS_A_SERVICE.md`](./docs/RUNNING_AS_A_SERVICE.md)**, keeping it running: launchd, systemd, Windows.
 - **[`docs/TROUBLESHOOTING.md`](./docs/TROUBLESHOOTING.md)**, failure-state table and common fixes.
 - **[`SECURITY.md`](./SECURITY.md)**, threat model and vulnerability reporting.
 - **[`CHANGELOG.md`](./CHANGELOG.md)**, release history.
