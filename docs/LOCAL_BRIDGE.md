@@ -157,6 +157,11 @@ it never pulls `DATABASE_URL` / `ANTHROPIC_API_KEY` / other app secrets into the
 process. Inline env still wins (`BRIDGE_BACKEND=codex npm run bridge` overrides the file for
 one run). Values are never logged, only a `loaded N setting(s) from <file>` line.
 
+**If a key appears twice in the file, the first occurrence wins**, unlike a shell script,
+where the last assignment wins. `.env.example` shows some keys twice (for example the
+default `BRIDGE_COMMAND` and the Apple one), so when you uncomment one, comment out the
+other.
+
 ### Auth: the CLIs use their OWN login, not your API keys
 
 By default the bridge **strips** `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / … from the CLI's
