@@ -122,7 +122,16 @@ BRIDGE_BACKEND=auto BRIDGE_MODELS="sonnet,sonnet:xhigh,opus,haiku,gpt-5.6-sol,gp
 
 # Any other CLI that reads a prompt on stdin and prints the answer
 BRIDGE_BACKEND=command BRIDGE_COMMAND='ollama run {model}' npm run bridge
+
+# Claude + Codex + Apple's on-device Foundation Model (macOS 27) on one port
+BRIDGE_BACKEND=auto BRIDGE_AUTO_DEFAULT=command BRIDGE_COMMAND='fm respond --no-stream' \
+  BRIDGE_MODELS="sonnet,opus,haiku,gpt-5.5,system" npm run bridge
 ```
+
+The last example needs no new code: Apple's `fm` CLI reads a prompt on stdin, so the
+generic `command` backend serves it, and request model `system` routes to it. See
+[Apple Foundation Models](./docs/LOCAL_BRIDGE.md#apple-foundation-models-macos-27) for the
+details and the one catch.
 
 Config can live in a file instead of the shell: the bridge auto-loads `.env.bridge.local` /
 `.env.local` (only `BRIDGE_*` keys are read). Copy [`.env.example`](./.env.example) to get

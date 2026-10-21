@@ -53,6 +53,41 @@ Claude Code and a request for a `gpt-*`/`codex` model routes to Codex, so you re
 single custom endpoint in your application and pick the model per request. Set
 `BRIDGE_MODELS` to the union of both families so a model dropdown prefills them all.
 
+### Apple Foundation Models (macOS 27)
+
+macOS 27 ships Apple's on-device Foundation Model with an `fm` CLI at `/usr/bin/fm`.
+`fm respond` reads a prompt on stdin and prints the answer, so the `command` backend serves
+it with config alone. To add it to an `auto` bridge alongside Claude and Codex:
+
+```bash
+BRIDGE_BACKEND=auto
+BRIDGE_AUTO_DEFAULT=command
+BRIDGE_COMMAND='fm respond --no-stream'
+BRIDGE_MODELS=sonnet,opus,haiku,gpt-5.5,system   # your existing list, plus "system"
+```
+
+Requests for model `system` then go to the on-device model, and Claude and Codex ids route
+as before. The bridge's API key check and the Cloudflare Tunnel path apply to it like any
+other backend, so a remote application can reach it. Check `fm available` reports the
+model as available, and read Apple's terms with `fm license` before exposing it remotely.
+
+Things to know:
+
+- **A mistyped model id now goes to `fm`.** `BRIDGE_AUTO_DEFAULT` catches every id that is
+  not recognisably Claude (`opus`/`sonnet`/`haiku`/`claude`) or Codex (`gpt`/`codex`/`o1`
+  and so on). With the default (`claude`), a typo reaches Claude; with `command`, it
+  reaches Apple's model and returns an answer instead of an error.
+- **Prompts stay on the Mac.** The model runs on the device and `--no-stream` saves no
+  transcript. The bridge logs only the model id, response size and timing for a successful
+  request. A failed request logs the error, which can include the CLI's stderr.
+- **It is a small model.** Good for tagging, classification, short summaries and field
+  extraction; not a replacement for Claude or Codex on long or hard work.
+- **Local only? You may not need the bridge.** `fm serve --port 1976` runs Apple's own
+  Chat Completions server, with streaming and reported token counts. It has no auth, and
+  it streams when a request omits `stream`, so send `"stream": false` for a single JSON
+  reply. Use the bridge when you want an API key, the tunnel, or one endpoint for every
+  model.
+
 ### Environment
 
 | Var | Default | Purpose |

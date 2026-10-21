@@ -4,6 +4,12 @@
 
 ### Added
 
+- **Apple Foundation Models setup (docs only, no code change).** macOS 27's `fm` CLI reads
+  a prompt on stdin, so the existing `command` backend serves Apple's on-device model. A
+  new section in `docs/LOCAL_BRIDGE.md` and a README example show how to serve it as model
+  `system` from an `auto` bridge next to Claude and Codex, including the catch that
+  `BRIDGE_AUTO_DEFAULT=command` sends mistyped model ids to `fm` instead of Claude.
+
 - **`docs/RUNNING_AS_A_SERVICE.md`.** Running the bridge under launchd, `systemd --user`,
   and Windows Task Scheduler. The foreground quick start is fine for a trial, but the
   tunnel setup this project exists for needs an origin that survives a closed terminal.
