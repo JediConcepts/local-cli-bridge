@@ -255,7 +255,7 @@ const BACKENDS = {
    * bridge estimates them (~4 chars/token).
    */
   claude: {
-    build({ model, system, prompt }) {
+    build({ model, system, prompt, webSearch }) {
       // Minimal, subscription-friendly invocation. Deliberately NO --bare: it isolates
       // the run and stops Claude Code from seeing the ~/.claude credentials that
       // `claude` + `/login` set up ("Not logged in"). The child env also has the
@@ -272,6 +272,9 @@ const BACKENDS = {
       if (modelId) args.push("--model", modelId);
       if (effort && CLAUDE_EFFORTS.has(effort)) args.push("--effort", effort);
       if (system) args.push("--append-system-prompt", system);
+      // Opt-in web search ("web_search": true in the request): only the read-only web
+      // tools. One token, so the variadic flag cannot swallow anything after it.
+      if (webSearch) args.push("--allowedTools=WebSearch,WebFetch");
       const extra = argsFromEnv({
         json: process.env.BRIDGE_CLAUDE_ARGS_JSON,
         text: process.env.BRIDGE_CLAUDE_ARGS,
@@ -299,11 +302,12 @@ const BACKENDS = {
    * piped prompt (same shape as the command backend) rather than dropped.
    */
   codex: {
-    build({ model, system, prompt }) {
+    build({ model, system, prompt, webSearch }) {
       // randomUUID, not Date.now(): two concurrent completions starting in the
       // same millisecond must not share (and cross-read/unlink) one result file.
       const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${crypto.randomUUID()}.txt`);
-      const args = ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", outFile];
+      // Opt-in web search: --search is a top-level codex flag, so it goes before `exec`.
+      const args = [...(webSearch ? ["--search"] : []), "exec","--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", outFile];
       const { id, effort } = splitModelEffort(model);
       if (id) args.push("--model", id);
       // -c parses its value as TOML, the inner double quotes are required.
@@ -442,11 +446,11 @@ function killChildGracefully(child) {
   child.once("close", () => clearTimeout(hardKill));
 }
 
-function runBackend({ model, system, prompt }, { signal } = {}) {
+function runBackend({ model, system, prompt, webSearch = false }, { signal } = {}) {
   const backendName = resolveBackendName(model);
   const backend = BACKENDS[backendName];
   if (!backend) throw new Error(`Unknown backend "${backendName}" (claude | codex | command | auto)`);
-  const { cmd, args, stdin, resultFile } = backend.build({ model: model || DEFAULT_MODEL, system, prompt });
+  const { cmd, args, stdin, resultFile } = backend.build({ model: model || DEFAULT_MODEL, system, prompt, webSearch });
 
   // Force the CLI onto its own login: strip provider API keys from the child env.
   const childEnv = { ...process.env };
@@ -872,12 +876,13 @@ function handleRequest(req, res) {
       };
 
       try {
+        const webSearch = body.web_search === true;
         const { text, promptTokens, completionTokens } = await runBackend(
-          { model: body.model, system, prompt },
+          { model: body.model, system, prompt, webSearch },
           { signal: ac.signal },
         );
         log.info(
-          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""} → ${text.length} chars in ${Date.now() - t0}ms`,
+          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""}${webSearch ? " +web" : ""} → ${text.length} chars in ${Date.now() - t0}ms`,
         );
         return finish(
           200,

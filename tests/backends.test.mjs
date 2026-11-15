@@ -173,3 +173,21 @@ test("command build: BRIDGE_COMMAND_JSON wins and is used verbatim", () => {
 test("command build: fails loudly when neither template variable is set", () => {
   assert.throws(() => BACKENDS.command.build({ model: "m", system: "", prompt: "p" }), /BRIDGE_COMMAND/);
 });
+
+// ── opt-in web search ───────────────────────────────────────────────────────
+
+test("web search is off unless the request asks for it", () => {
+  assert.ok(!BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" }).args.some((a) => a.includes("allowedTools")));
+  assert.ok(!BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" }).args.includes("--search"));
+});
+
+test("claude build: webSearch allows only the read-only web tools, as one argv entry", () => {
+  const { args } = BACKENDS.claude.build({ model: "sonnet", system: "SYS", prompt: "p", webSearch: true });
+  assert.ok(args.includes("--allowedTools=WebSearch,WebFetch"));
+  assert.equal(args.filter((a) => a.includes("allowedTools")).length, 1);
+});
+
+test("codex build: webSearch puts the top-level --search flag before exec", () => {
+  const { args } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", webSearch: true });
+  assert.deepEqual(args.slice(0, 2), ["--search", "exec"]);
+});
