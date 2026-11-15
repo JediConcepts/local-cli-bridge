@@ -105,6 +105,58 @@ test("an auto bridge, which can run claude, refuses unsafe BRIDGE_CLAUDE_ARGS at
   assert.ok(stderr.includes('"--continue"'), stderr);
 });
 
+// ── Request fields in argv ──────────────────────────────────────────────────
+// A request's model and system text are a caller's strings, less trusted than
+// configuration, so they are held to at least the same rule: nothing a request
+// sends can stand in argv as an option of its own.
+
+test("system text that looks like an option reaches claude only joined to --append-system-prompt", async () => {
+  const stub = makeStubBin();
+  const bridge = await startBridge({ BRIDGE_BACKEND: "claude", BRIDGE_API_KEY: KEY, ...stub.env });
+  const settings = '--settings={"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}';
+  try {
+    for (const system of ["--mcp-config", settings]) {
+      for (const stream of [false, true]) {
+        stub.clear();
+        const res = await complete(bridge.base, {
+          model: "sonnet", stream, messages: [{ role: "system", content: system }, { role: "user", content: "the transcript" }],
+        });
+        assert.equal(res.status, 200);
+        await res.text();
+        const [run] = stub.records("claude");
+        assert.ok(run, "the stub claude ran");
+        assert.ok(!run.argv.includes(system), `${JSON.stringify(system)} stood as its own argv element: ${JSON.stringify(run.argv)}`);
+        assert.ok(run.argv.includes(`--append-system-prompt=${system}`), JSON.stringify(run.argv));
+        assert.ok(run.argv.includes("--model=sonnet"), JSON.stringify(run.argv));
+      }
+    }
+  } finally {
+    bridge.stop();
+  }
+});
+
+test("a request model that starts with \"-\" or is not a string is a 400 and no CLI runs, for every backend", async () => {
+  const stub = makeStubBin();
+  for (const backend of ["claude", "codex"]) {
+    const bridge = await startBridge({ BRIDGE_BACKEND: backend, BRIDGE_API_KEY: KEY, ...stub.env });
+    try {
+      for (const model of ["--resume", "--resume:high", '--settings={"env":{"X":"1"}}', "-r", ["--resume"], { id: "--resume" }]) {
+        for (const stream of [false, true]) {
+          const res = await complete(bridge.base, { model, stream, messages: MESSAGES });
+          assert.equal(res.status, 400, `${backend} ${JSON.stringify(model)} stream=${stream}`);
+          assert.equal(res.headers.get("content-type"), "application/json");
+          assert.ok((await res.json()).error.message.includes("model"));
+        }
+      }
+      assert.deepEqual(stub.records(backend), [], `${backend} never ran`);
+      const ok = await complete(bridge.base, { model: backend === "claude" ? "sonnet" : "gpt-5.5", messages: MESSAGES });
+      assert.equal(ok.status, 200, "an ordinary model id still works");
+    } finally {
+      bridge.stop();
+    }
+  }
+});
+
 // ── ANTHROPIC_BASE_URL ──────────────────────────────────────────────────────
 
 const STRAY = { ANTHROPIC_BASE_URL: "http://127.0.0.1:9/not-anthropic", ANTHROPIC_API_KEY: "sk-test-dummy" };

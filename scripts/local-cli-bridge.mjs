@@ -57,7 +57,7 @@
  *
  * Reasoning effort: request model "<id>:<effort>" and the bridge maps it per backend,
  *   "gpt-5.6-sol:high" → codex exec --model gpt-5.6-sol -c model_reasoning_effort="high"
- *   "sonnet:xhigh"     → claude -p --model sonnet --effort xhigh
+ *   "sonnet:xhigh"     → claude -p --model=sonnet --effort=xhigh
  * Advertise the variants you want via BRIDGE_MODELS. Effort values a backend doesn't
  * support are stripped and ignored (Claude accepts low|medium|high|xhigh|max).
  */
@@ -334,7 +334,7 @@ const BACKENDS = {
    * Claude Code CLI in headless print mode, one-shot completion, JSON output.
    * Invocation (authoritative, see also docs/LOCAL_BRIDGE.md):
    *   claude -p --output-format json --safe-mode --no-session-persistence --tools=
-   *     [--model <m>] [--effort <e>] [--append-system-prompt <s>]
+   *     [--model=<m>] [--effort=<e>] [--append-system-prompt=<s>]
    * with the prompt piped on stdin (fine up to Claude Code's 10MB stdin cap).
    * --output-format json → { result, is_error, session_id, ... }. Errors go to stderr +
    * a non-zero exit, which the runner surfaces. No token counts are in the JSON, so the
@@ -367,13 +367,18 @@ const BACKENDS = {
       ];
       // The effort suffix drives Claude too: current Claude Code has a first-class
       // `--effort low|medium|high|xhigh|max` (default high) that works in -p mode,
-      // so "sonnet:xhigh" → `--model sonnet --effort xhigh`. Values outside Claude's
+      // so "sonnet:xhigh" → `--model=sonnet --effort=xhigh`. Values outside Claude's
       // vocabulary (none/minimal/ultra are Codex-side) are stripped and ignored so an
       // invalid flag value never reaches the CLI.
+      // The model and the system text come from the request, a caller's strings, so
+      // each is joined to its flag in ONE token: a value such as "--settings={...}" or
+      // "--resume" is then only ever that flag's value, to commander and to anything
+      // that reads argv token by token, never an option of its own. (The same rule
+      // BRIDGE_CLAUDE_ARGS is held to: see checkClaudeExtraArgs.)
       const { id: modelId, effort } = splitModelEffort(model);
-      if (modelId) args.push("--model", modelId);
-      if (effort && CLAUDE_EFFORTS.has(effort)) args.push("--effort", effort);
-      if (system) args.push("--append-system-prompt", system);
+      if (modelId) args.push(`--model=${modelId}`);
+      if (effort && CLAUDE_EFFORTS.has(effort)) args.push(`--effort=${effort}`);
+      if (system) args.push(`--append-system-prompt=${system}`);
       // Opt-in web search ("web_search": true in the request): only the read-only web
       // tools. One token, so the variadic flag cannot swallow anything after it.
       if (webSearch) args.push("--allowedTools=WebSearch,WebFetch");
@@ -948,6 +953,12 @@ function handleRequest(req, res) {
       }
       if ((body.messages ?? []).some((m) => !ALLOWED_ROLES.has(m.role))) {
         return send(res, 400, { error: { message: `message role must be one of: ${[...ALLOWED_ROLES].join(", ")}` } });
+      }
+      // A model id never starts with "-". One that does, or one that is not a string,
+      // is refused before any backend sees it: the codex and command backends pass the
+      // model as its own argv element, where it could read as an option.
+      if (body.model != null && (typeof body.model !== "string" || body.model.startsWith("-"))) {
+        return send(res, 400, { error: { message: 'model must be a string that does not start with "-"' } });
       }
       const unsupported = unsupportedFeature(body);
       if (unsupported) {

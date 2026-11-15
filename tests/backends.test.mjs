@@ -85,15 +85,36 @@ test("claude build: model, effort, and system flags land in argv, prompt on stdi
   assert.equal(cmd, "claude");
   assert.deepEqual(args, [
     "-p", "--output-format", "json", "--safe-mode", "--no-session-persistence", "--tools=",
-    "--model", "sonnet", "--effort", "xhigh", "--append-system-prompt", "SYS",
+    "--model=sonnet", "--effort=xhigh", "--append-system-prompt=SYS",
   ]);
   assert.equal(stdin, "hello");
 });
 
 test("claude build: effort values outside Claude's vocabulary are stripped", () => {
   const { args } = BACKENDS.claude.build({ model: "sonnet:ultra", system: "", prompt: "p" });
-  assert.ok(!args.includes("--effort"));
-  assert.ok(args.includes("sonnet"));
+  assert.ok(!args.some((a) => a.startsWith("--effort")));
+  assert.ok(args.includes("--model=sonnet"));
+});
+
+// A request's model and system text are a caller's strings. Joined to their flag
+// in one token, a value that looks like an option ("--settings={...}", "--resume")
+// is only ever that flag's value, to commander and to anything that reads argv
+// token by token. So the option names in argv never depend on a request.
+test("claude build: a request's model and system text never stand as their own argv element", () => {
+  const fixed = ["-p", "--output-format", "json", "--safe-mode", "--no-session-persistence", "--tools="];
+  const settings = '--settings={"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}';
+  for (const [model, system, expected] of [
+    ['--settings={"env":{"X":"1"}}', "", ['--model=--settings={"env":{"X":"1"}}']],
+    ["--setting-sources=user,project,local", "", ["--model=--setting-sources=user,project,local"]],
+    ["--resume:high", "", ["--model=--resume", "--effort=high"]],
+    ["-r", "", ["--model=-r"]],
+    ["sonnet", "--mcp-config", ["--model=sonnet", "--append-system-prompt=--mcp-config"]],
+    ["sonnet", settings, ["--model=sonnet", `--append-system-prompt=${settings}`]],
+    ["sonnet", "- be brief\n--resume", ["--model=sonnet", "--append-system-prompt=- be brief\n--resume"]],
+  ]) {
+    const { args } = BACKENDS.claude.build({ model, system, prompt: "p" });
+    assert.deepEqual(args, [...fixed, ...expected], JSON.stringify({ model, system }));
+  }
 });
 
 test("claude build: quoted BRIDGE_CLAUDE_ARGS survive as single argv entries", () => {

@@ -40,6 +40,10 @@ starts with:
 `BRIDGE_CLAUDE_ARGS` and `BRIDGE_CLAUDE_ARGS_JSON` are an allowlist of options that shape
 or narrow a run, so configuration cannot give Claude Code tools, turn these options off
 or resume a session; a value that would stops a `claude` or `auto` bridge at start.
+A request's model, effort and system text are joined to their flags in one token
+(`--model=…`, `--effort=…`, `--append-system-prompt=…`), so a value that looks like an
+option, such as `--settings={...}`, is only ever that flag's value. A request `model`
+that starts with `-`, or is not a string, is refused with a 400 for every backend.
 Codex runs `--ephemeral --sandbox read-only`, and the `command` backend runs whatever the
 operator configured.
 

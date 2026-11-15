@@ -63,6 +63,13 @@
   gets `--tools=WebSearch,WebFetch` and the existing `--allowedTools=WebSearch,WebFetch`,
   and nothing more. The tool lists are single `--flag=value` tokens, so the variadic
   flags cannot swallow a later argument.
+- **Nothing a request sends can stand in Claude Code's argv as an option.** The
+  request's model, effort and system text used to be separate tokens after `--model`,
+  `--effort` and `--append-system-prompt`, so a request could put an exact flag token
+  such as `--settings={...}` there. They are now joined to their flags in one token
+  (`--model=sonnet`), so such a value is only ever the flag's value. A request `model`
+  that starts with `-`, or is not a string, is now a 400 for every backend, because the
+  `codex` and `command` backends pass the model as its own argument.
 - **`ANTHROPIC_BASE_URL` never reaches a CLI.** It is removed from the child's
   environment for every backend, even with `BRIDGE_KEEP_ENV_KEYS=1`, so a stray setting
   cannot send prompts to a host other than Anthropic.

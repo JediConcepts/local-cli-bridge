@@ -188,7 +188,7 @@ to reroute traffic.
 This section is authoritative for what the bridge actually runs:
 
 - **`claude`**, `claude -p --output-format json --safe-mode --no-session-persistence
-  --tools= --model <m> --append-system-prompt <s>`, prompt piped on stdin. Notably **no
+  --tools= --model=<m> --append-system-prompt=<s>`, prompt piped on stdin. Notably **no
   `--bare`**, which isolates the run and stops Claude Code from seeing the login
   credentials that `claude` + `/login` set up. JSON output has no token counts, so the
   bridge estimates them (~4 chars/token); stdin caps at 10 MB (fine for ~60k-token
@@ -207,6 +207,14 @@ This section is authoritative for what the bridge actually runs:
 
   Both tool flags are written as one `--flag=value` token: they are variadic, and as
   separate tokens they would take every following argument that does not start with `-`.
+
+  The request's model, effort and system text are written the same way (`--model=<m>`,
+  `--effort=<e>`, `--append-system-prompt=<s>`). They are a caller's strings, so a value
+  such as `--settings={...}` or `--resume` is then only ever that flag's value, to Claude
+  Code's parser and to anything that reads argv token by token, and never an option of
+  its own. A request whose `model` starts with `-`, or is not a string, is refused with a
+  400 for every backend, since the `codex` and `command` backends pass the model as its
+  own argument.
 
   `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CLAUDE_ARGS_JSON` are appended after these and are an
   **allowlist**, so they cannot give Claude Code tools, turn these options off or resume
@@ -284,7 +292,7 @@ change:
 request model "gpt-5.6-sol:high"
   → codex exec --model gpt-5.6-sol -c model_reasoning_effort="high"
 request model "sonnet:xhigh"
-  → claude -p --model sonnet --effort xhigh
+  → claude -p --model=sonnet --effort=xhigh
 ```
 
 Advertise the variants you actually want in the dropdown, e.g.:

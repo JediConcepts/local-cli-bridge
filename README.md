@@ -203,6 +203,9 @@ JSON argv forms, cancellation semantics) is in
   it to run anything; a request with `"web_search": true` gets WebSearch and WebFetch
   only) and `--no-session-persistence` (the prompt is not saved as a session).
   `BRIDGE_CLAUDE_ARGS` cannot undo any of these: a value that would is refused at start.
+  A request's model and system text reach Claude Code only joined to their flags
+  (`--model=…`), so nothing a request sends can stand in argv as an option, and a
+  request `model` that starts with `-` is a 400.
 - Provider API keys are stripped from the CLI's environment by default, and
   `ANTHROPIC_BASE_URL` always is, so prompts go to Anthropic and nowhere else.
 - Request body, process output, concurrency, and per-request time are all capped; a
