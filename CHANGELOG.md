@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Streaming (`stream: true`).** A truthy `stream` used to be a 400; it now gets an
+  OpenAI-style event stream. The bridge answers `200 text/event-stream` at once, sends an
+  SSE comment heartbeat at least every 10 s (or every `BRIDGE_KEEPALIVE_MS` when that is
+  shorter) while the CLI runs, then a role chunk, the whole answer as one content chunk,
+  a `stop` chunk and `data: [DONE]`. `stream_options.include_usage` adds a usage chunk
+  with the same estimate a buffered completion reports. A failure after the headers is
+  one `data: {"error":{…}}` event, redacted as before, and the stream ends without
+  `[DONE]`. Auth, validation, the concurrency limit, `BRIDGE_TIMEOUT_MS` and killing the
+  CLI when the client disconnects work as before, and the JSON keepalive never writes
+  into a stream. Clients that always stream, such as a meeting recorder whose minutes can
+  take 15 minutes to write, can now use the bridge. Non-streaming responses are
+  unchanged.
+- An opt-in end-to-end test (`tests/meetingbox.test.mjs`) that runs meetingbox's
+  minutes writer, a real streaming client built on ai-execution-router, against the
+  bridge. It is skipped unless `MEETINGBOX_MINUTES_DIR` points at an installed copy.
+
 - **Apple Foundation Models setup (docs only, no code change).** macOS 27's `fm` CLI reads
   a prompt on stdin, so the existing `command` backend serves Apple's on-device model. A
   new section in `docs/LOCAL_BRIDGE.md` and a README example show how to serve it as model
@@ -30,6 +46,26 @@
   why their models were missing. It now names the paths it tried. A file that exists but
   applies nothing (every key already set inline, or no `BRIDGE_*` keys at all) says which
   of the two it was.
+- **`BRIDGE_CLAUDE_ARGS` and `BRIDGE_CLAUDE_ARGS_JSON` are an allowlist.** They may use
+  `--model`, `--fallback-model`, `--effort`, `--append-system-prompt`, `--system-prompt`,
+  `--max-turns`, `--max-budget-usd`, `--permission-mode` (`default`, `manual`, `dontAsk`
+  or `plan`), `--disallowedTools`, `--strict-mcp-config`, `--disable-slash-commands` and
+  `--no-chrome`, and nothing else. A `claude` or `auto` bridge given anything else, such
+  as `--add-dir`, `--mcp-config`, `--allowedTools` or `--resume`, refuses to start and
+  names the flag. **Breaking** for a configuration that used one of those.
+
+### Security
+
+- **Claude Code runs with no tools, in safe mode, with no saved session.** Every run now
+  adds `--safe-mode`, `--no-session-persistence` and `--tools=` (no tools), so nothing in
+  a prompt, which is whatever a caller sent, can get Claude Code to run anything on this
+  machine, and the prompt is not kept as a session. A request with `"web_search": true`
+  gets `--tools=WebSearch,WebFetch` and the existing `--allowedTools=WebSearch,WebFetch`,
+  and nothing more. The tool lists are single `--flag=value` tokens, so the variadic
+  flags cannot swallow a later argument.
+- **`ANTHROPIC_BASE_URL` never reaches a CLI.** It is removed from the child's
+  environment for every backend, even with `BRIDGE_KEEP_ENV_KEYS=1`, so a stray setting
+  cannot send prompts to a host other than Anthropic.
 
 ## 0.3.0
 

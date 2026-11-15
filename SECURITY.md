@@ -26,11 +26,30 @@ of Cloudflare edge headers) may view `GET` discovery routes; `?key=` and
 the hostname. Completions always require the Bearer. Note the bridge ships **one shared
 static key**: there is no per-client identity, rotation, or rate limiting per caller.
 
+**Prompt content.** A prompt is whatever a caller sent: a meeting transcript, a scraped
+page, a document. Anything said or written in it is untrusted. So every Claude Code run
+starts with:
+
+- `--safe-mode`: none of this machine's CLAUDE.md, skills, plugins, hooks, MCP servers
+  or custom agents (admin-managed policy settings still apply);
+- `--tools ""` (written `--tools=`): no tools, so nothing in a prompt can get Claude
+  Code to read, write or run anything on this machine. A request with
+  `"web_search": true` gets WebSearch and WebFetch only;
+- `--no-session-persistence`: the prompt and the answer are not saved as a session.
+
+`BRIDGE_CLAUDE_ARGS` and `BRIDGE_CLAUDE_ARGS_JSON` are an allowlist of options that shape
+or narrow a run, so configuration cannot give Claude Code tools, turn these options off
+or resume a session; a value that would stops a `claude` or `auto` bridge at start.
+Codex runs `--ephemeral --sandbox read-only`, and the `command` backend runs whatever the
+operator configured.
+
 **Secrets.** Provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are stripped
 from the spawned CLI's environment by default, so a stray key in your shell cannot be
 exfiltrated through a CLI that echoes its environment, and the CLI stays on its own
-login. The env-file loader imports only allowlisted `BRIDGE_*` keys, never other app
-secrets. Raw backend error messages (which can reveal executable names, paths, and login
+login. `ANTHROPIC_BASE_URL` is removed for every backend, even with
+`BRIDGE_KEEP_ENV_KEYS=1`: left set by another tool or a proxy setup, it would send every
+prompt to a host other than Anthropic. The env-file loader imports only allowlisted
+`BRIDGE_*` keys, never other app secrets. Raw backend error messages (which can reveal executable names, paths, and login
 state) are redacted from clients by default and replaced with a correlation id that keys
 the full detail in the server log; messages the bridge itself generates about limits and
 timeouts are exposed because they reveal nothing about the host.
@@ -51,7 +70,11 @@ management is performed, and Windows signal semantics differ.
 rate limiting or audit trail; the `command` backend runs whatever command the operator
 configures (the bridge parses the template without a shell, but the configured executable
 itself is trusted by definition); capability figures on `/v1/models` are configured
-assumptions, not verified facts.
+assumptions, not verified facts. A request with `"web_search": true` lets Claude Code
+fetch any URL, so a prompt that asks it to can send parts of itself to a web server:
+opt in only for prompts you trust. Once an event stream (`stream: true`) has started, a
+failure can no longer change the status code: it arrives as a `data: {"error":…}`
+event on the `200`, and a client must treat it as a failure.
 
 ## Supported versions
 
@@ -71,6 +94,8 @@ maintained side project, not a staffed security team.
 - Keep `BRIDGE_EXPOSE_ERROR_DETAILS=0` anywhere a remote party can see responses.
 - For remote use: Cloudflare Access service token + named tunnel + strong random Bearer,
   and rotate the Bearer when a client machine is retired.
-- Add CLI-side hardening flags via `BRIDGE_CLAUDE_ARGS` (e.g.
-  `--permission-mode dontAsk --max-turns 1`); Codex already runs `--sandbox read-only`.
+- No CLI-side hardening flags are needed: Claude Code already runs with `--safe-mode`,
+  no tools and no saved session, and `BRIDGE_CLAUDE_ARGS` cannot loosen that; Codex
+  already runs `--sandbox read-only`.
+- Leave `"web_search": true` off for prompts you do not trust.
 - Lower `BRIDGE_MAX_CONCURRENT` and `BRIDGE_TIMEOUT_MS` to the minimum your workload needs.

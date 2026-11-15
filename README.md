@@ -39,13 +39,13 @@ rest loudly** (400 with the feature named) instead of silently ignoring it:
 
 | Capability | Support | Notes |
 |---|---|---|
-| `POST /v1/chat/completions` | ✅ | one buffered (non-streaming) completion |
+| `POST /v1/chat/completions` | ✅ | one completion, buffered, or as an event stream with `stream: true` |
 | `GET /v1/models` | ✅ | plus `context_window` / `max_output_tokens` / `caps_source` ([configured assumptions](./docs/LOCAL_BRIDGE.md#model-capabilities-are-configured-assumptions-not-discovered-values), not discovered) |
 | `GET /health` | ✅ (extension) | auth-enforced liveness + model list |
 | System / developer messages | ✅ | folded into the CLI's system text |
 | Multi-turn history | ✅ | flattened to a labeled transcript (the CLIs are one-shot) |
 | Model-id `:effort` suffix | ✅ (extension) | `sonnet:xhigh`, `gpt-5.6-sol:high` |
-| Streaming (`stream`) | ❌ 400 | any truthy value |
+| Streaming (`stream`) | ✅ | any truthy value: `text/event-stream` at once, comment heartbeats at least every 10 s while the CLI runs, then the answer as one content chunk and `[DONE]`; `stream_options.include_usage` adds the estimated usage ([details](./docs/LOCAL_BRIDGE.md#streaming)) |
 | Tools / functions / `tool_choice` | ❌ 400 | explicit `null` tolerated |
 | `response_format` | ❌ 400 | |
 | Image / content-block messages | ❌ 400 | string content only |
@@ -107,6 +107,9 @@ to its **own subscription login**:
 This is deliberate, a stray API key in your shell/`.env` otherwise pushes the CLI into
 API-key mode and it reports *"Not logged in · Please run /login"* even after you've logged in.
 To use an API key on purpose instead, set `BRIDGE_KEEP_ENV_KEYS=1`.
+
+`ANTHROPIC_BASE_URL` is removed in every case, `BRIDGE_KEEP_ENV_KEYS=1` included, so a
+stray setting cannot send prompts to a host other than Anthropic.
 
 ### 3. Run it
 
@@ -182,9 +185,9 @@ The tunnel launcher **fails closed**, it refuses to start without `BRIDGE_API_KE
 | `BRIDGE_EMBED_MODEL` | `nomic-embed-text` | model for `/v1/embeddings` requests that omit one |
 | `BRIDGE_MAX_BODY_BYTES` | 10 MB | request body ceiling (413 above it) |
 | `BRIDGE_MAX_PROCESS_OUTPUT_BYTES` | 10 MB | ceiling on total child output — stdout + stderr + result file (502 above it) |
-| `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat: `auto` heartbeats only tunnel-forwarded requests, local calls keep real status codes; `0` never, `N` ms always |
+| `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat: `auto` heartbeats only tunnel-forwarded requests, local calls keep real status codes; `0` never, `N` ms always. An event stream always heartbeats, at least every 10 s |
 | `BRIDGE_EXPOSE_ERROR_DETAILS` | `0` | `1` returns raw backend error messages to clients, local debugging only |
-| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` | — | extra CLI flags (quoted values supported); `*_ARGS_JSON` variants take a JSON array for exact argv |
+| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` | — | extra CLI flags (quoted values supported); `*_ARGS_JSON` variants take a JSON array for exact argv. Claude's may only shape or narrow a run: anything that would give Claude Code tools, turn off its safety options or resume a session is refused at start ([the allowed options](./docs/LOCAL_BRIDGE.md#how-the-backends-invoke-the-clis)) |
 
 Full reference (effort suffixes, model capabilities, `command` backend, `auto` dispatch,
 JSON argv forms, cancellation semantics) is in
@@ -194,7 +197,14 @@ JSON argv forms, cancellation semantics) is in
 
 - Loopback bind by default; the only supported remote path is tunnel + Access + Bearer.
 - Constant-time Bearer comparison; the tunnel launcher fails closed without a key.
-- Provider API keys are stripped from the CLI's environment by default.
+- A prompt is whatever a caller sent (a meeting transcript, a scraped page), so every
+  Claude Code run starts with `--safe-mode` (none of this machine's CLAUDE.md, skills,
+  plugins, hooks or MCP servers), `--tools ""` (no tools, so nothing in a prompt can get
+  it to run anything; a request with `"web_search": true` gets WebSearch and WebFetch
+  only) and `--no-session-persistence` (the prompt is not saved as a session).
+  `BRIDGE_CLAUDE_ARGS` cannot undo any of these: a value that would is refused at start.
+- Provider API keys are stripped from the CLI's environment by default, and
+  `ANTHROPIC_BASE_URL` always is, so prompts go to Anthropic and nowhere else.
 - Request body, process output, concurrency, and per-request time are all capped; a
   disconnected client's CLI child is killed (best effort — see [SECURITY.md](./SECURITY.md)).
 - Raw backend errors are redacted from clients by default, with a correlation id linking
@@ -221,7 +231,8 @@ Threat model, residual risks, and vulnerability reporting: [SECURITY.md](./SECUR
 | `413` | Request body over `BRIDGE_MAX_BODY_BYTES` (default 10 MB). |
 | `502` / `504` | Backend failed / backend timed out. Details are in the server log under the response's correlation id. |
 | Remote call dies at ~100s with a `524` | The keepalive defeats this for tunnel traffic by default (`auto`); ensure `BRIDGE_KEEPALIVE_MS` isn't `0`. |
-| A `200` with an `{"error":{…}}` body | Tunnel-keepalive contract: the failure arrived after the status was committed. Treat an `error` body as failure. |
+| A `200` with an `{"error":{…}}` body | Tunnel-keepalive contract: the failure arrived after the status was committed. Treat an `error` body as failure. In an event stream the same failure is a `data: {"error":{…}}` event, with no `[DONE]` after it. |
+| `refusing to start: BRIDGE_CLAUDE_ARGS…` | An extra Claude argument would give Claude Code tools, turn off its safety options or resume a session. The message names the flag; remove it. |
 
 Full layer-by-layer failure table and the "Not logged in" flow:
 [`docs/TROUBLESHOOTING.md`](./docs/TROUBLESHOOTING.md).

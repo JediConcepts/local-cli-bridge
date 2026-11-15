@@ -102,7 +102,7 @@ Things to know:
 | `BRIDGE_MODELS` | per-backend | comma-separated ids advertised on `/v1/models` to prefill a routing dropdown. Defaults: `claude` **and** `auto` advertise `opus,sonnet,haiku`; `codex` and `command` advertise nothing (empty list — a routing UI can fall back to free-text). Codex slugs vary per account, so set your own, e.g. `BRIDGE_MODELS="gpt-5.5,gpt-5.6-sol"` — especially in `auto` mode, where the Claude-only default otherwise prefills ids a Codex-only deployment can't serve |
 | `BRIDGE_TIMEOUT_MS` | `900000` | per-request CLI timeout; on expiry the child is killed (SIGTERM, then SIGKILL after 2s) and the request fails `504` |
 | `BRIDGE_API_KEY` |, | if set, callers must send `Authorization: Bearer <it>` |
-| `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat. `auto` heartbeats **only requests carrying Cloudflare edge headers** (a heuristic on `cf-ray` / `cf-connecting-ip` — forgeable, and forging merely turns the heartbeat on for that request), so local calls keep real status codes; `0` never heartbeats, a number heartbeats every N ms for every request (see [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md)) |
+| `BRIDGE_KEEPALIVE_MS` | `auto` | Cloudflare-524 heartbeat. `auto` heartbeats **only requests carrying Cloudflare edge headers** (a heuristic on `cf-ray` / `cf-connecting-ip` — forgeable, and forging merely turns the heartbeat on for that request), so local calls keep real status codes; `0` never heartbeats, a number heartbeats every N ms for every request (see [REMOTE_BRIDGE.md](./REMOTE_BRIDGE.md)). An event stream (`stream: true`) heartbeats with SSE comments instead, whatever this says: every N ms when N is under 10 s, otherwise every 10 s (see [Streaming](#streaming)) |
 | `BRIDGE_MAX_BODY_BYTES` | `10485760` | request body ceiling (10 MB, the CLI stdin cap); excess → 413 |
 | `BRIDGE_MAX_PROCESS_OUTPUT_BYTES` | `10485760` | ceiling on **total child process output** — stdout + stderr + the Codex result file, agent chatter included, not just the model answer. On breach the child is killed and the request fails `502` |
 | `BRIDGE_MAX_CONCURRENT` | `4` | ceiling on live CLI child processes; excess → 429. Held until a child actually exits — including one that is being killed after its client disconnected — so it can never be exceeded during cancellation. Single-user operators can lower it |
@@ -112,9 +112,9 @@ Things to know:
 | `BRIDGE_EXPOSE_ERROR_DETAILS` | `0` | `1` returns raw backend error messages to the client (they can reveal executable names, paths, and login state), set it only on a trusted local deployment; the default returns a generic message + correlation id, with full detail in the server log |
 | `BRIDGE_ALLOW_QUERY_KEY` | `0` | `1` enables `GET /v1/models?key=<BRIDGE_API_KEY>` for browser viewing through the tunnel (key lands in history/logs, opt-in) |
 | `BRIDGE_TRUST_CF_ACCESS` | `0` | `1` lets requests that passed Cloudflare Access (edge-stamped `Cf-Access-Jwt-Assertion`) view GET discovery routes. Only sound while Access covers the hostname |
-| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND`. Quotes group **and are stripped** (shell-style): a flag whose value must contain literal quotes — a Codex TOML override, say — needs them nested, `-c 'model_reasoning_effort="high"'`, or the `*_ARGS_JSON` form |
+| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND`. Quotes group **and are stripped** (shell-style): a flag whose value must contain literal quotes — a Codex TOML override, say — needs them nested, `-c 'model_reasoning_effort="high"'`, or the `*_ARGS_JSON` form. `BRIDGE_CLAUDE_ARGS` is an allowlist: see [How the backends invoke the CLIs](#how-the-backends-invoke-the-clis) |
 | `BRIDGE_CLAUDE_ARGS_JSON` / `BRIDGE_CODEX_ARGS_JSON` |, | exact form: a JSON array of strings, wins over the plain variable when both are set |
-| `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them) |
+| `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them). `ANTHROPIC_BASE_URL` is removed either way |
 | `BRIDGE_ENV_FILE` |, | explicit env-file path, overriding the auto-load order below |
 | `BRIDGE_MODEL_CAPS` |, | per-model capability overrides: `"gpt-5.5=1000000:128000,opus=200000:32000"` (`<id>=<context>:<maxOutput>`). Overrides win over the family defaults and are reported with `caps_source: "override"` |
 
@@ -172,6 +172,13 @@ sends the CLI into API-key mode and it reports **"Not logged in · Please run /l
 after you've logged in. (Set `BRIDGE_KEEP_ENV_KEYS=1` to keep the keys, e.g. to use an API
 key on purpose.)
 
+`ANTHROPIC_BASE_URL` is removed from every CLI's environment, for every backend, even with
+`BRIDGE_KEEP_ENV_KEYS=1`. It points Claude Code (and anything else built on Anthropic's SDK)
+at a different API host. Left in a shell profile by some other tool, or set for a proxy, it
+would quietly send every prompt the bridge handles, a meeting transcript say, to that host
+instead of Anthropic. `BRIDGE_KEEP_ENV_KEYS` keeps a credential on purpose; it is not a way
+to reroute traffic.
+
 **If you still see "Not logged in":** run `claude` once interactively and `/login`, confirm
 `claude -p "say ok"` works in a plain terminal, then restart the bridge. Full flow:
 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
@@ -180,12 +187,48 @@ key on purpose.)
 
 This section is authoritative for what the bridge actually runs:
 
-- **`claude`**, `claude -p --output-format json --model <m> --append-system-prompt <s>`,
-  prompt piped on stdin. Minimal flags, notably **no `--bare`**, which isolates the run
-  and stops Claude Code from seeing the login credentials that `claude` + `/login` set up.
-  Add hardening (`--permission-mode dontAsk --max-turns 1`) via `BRIDGE_CLAUDE_ARGS` if you
-  want. JSON output has no token counts, so the bridge estimates them (~4 chars/token);
-  stdin caps at 10 MB (fine for ~60k-token prompts).
+- **`claude`**, `claude -p --output-format json --safe-mode --no-session-persistence
+  --tools= --model <m> --append-system-prompt <s>`, prompt piped on stdin. Notably **no
+  `--bare`**, which isolates the run and stops Claude Code from seeing the login
+  credentials that `claude` + `/login` set up. JSON output has no token counts, so the
+  bridge estimates them (~4 chars/token); stdin caps at 10 MB (fine for ~60k-token
+  prompts).
+
+  A prompt is whatever a caller sent, a meeting transcript or a scraped page, so three
+  options are on every run, whatever the request or the configuration:
+
+  - `--safe-mode`: none of this machine's CLAUDE.md, skills, plugins, hooks, MCP servers
+    or custom agents (admin-managed policy settings still apply);
+  - `--tools=` (the same as `--tools ""`): no tools at all, so nothing said in a prompt
+    can get Claude Code to run anything. A request with `"web_search": true` gets
+    `--tools=WebSearch,WebFetch` and `--allowedTools=WebSearch,WebFetch`, the read-only
+    web tools and nothing else;
+  - `--no-session-persistence`: the prompt and the answer are not saved as a session.
+
+  Both tool flags are written as one `--flag=value` token: they are variadic, and as
+  separate tokens they would take every following argument that does not start with `-`.
+
+  `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CLAUDE_ARGS_JSON` are appended after these and are an
+  **allowlist**, so they cannot give Claude Code tools, turn these options off or resume
+  a session. Every token that starts with `-` must be one of these, wherever it stands:
+
+  | Option | Takes |
+  |---|---|
+  | `--model`, `--fallback-model`, `--effort` | one value |
+  | `--append-system-prompt`, `--system-prompt` | one value |
+  | `--max-turns`, `--max-budget-usd` | one value |
+  | `--permission-mode` | `default`, `manual`, `dontAsk` or `plan` only |
+  | `--disallowedTools`, `--disallowed-tools` | one or more tool names |
+  | `--strict-mcp-config`, `--disable-slash-commands`, `--no-chrome` | nothing |
+
+  A value may follow as the next token or after `=` (`--append-system-prompt="- be brief"`
+  for one that starts with `-`). Anything else, such as `--tools`, `--allowedTools`,
+  `--add-dir`, `--mcp-config`, `--settings`, `--dangerously-skip-permissions`,
+  `--permission-mode bypassPermissions`, `--resume` or `--continue`, a short flag or a
+  bare argument, stops a `claude` or `auto` bridge at start with a message naming the
+  variable and the flag. The old advice to add hardening here (`--permission-mode
+  dontAsk --max-turns 1`) still works but is no longer needed: there are no tools to
+  permit.
 - **`codex`**, `codex exec --ephemeral --sandbox read-only --skip-git-repo-check
   --output-last-message <tmp>`, prompt on stdin. Codex writes only its final message to
   `<tmp>`, which the bridge reads, so agent chatter on stdout never pollutes the answer,
@@ -204,6 +247,32 @@ The request's concurrency slot is held until the child has actually exited, so
 cancellation pressure. Termination is **best effort**: only the direct child is signalled
 — subprocesses the CLI spawned itself may survive on some platforms, and Windows signal
 semantics differ.
+
+### Streaming
+
+A request with a truthy `stream` (on `/v1/chat/completions` or `/chat/completions`) gets
+an OpenAI-style event stream. The CLIs answer in one piece, so the stream is shaped
+around that:
+
+1. `200` with `Content-Type: text/event-stream` at once, before the CLI starts.
+2. While the CLI runs, an SSE comment (`: keepalive`) at once and then at least every
+   10 s, or every `BRIDGE_KEEPALIVE_MS` when that is shorter. Clients skip comments, but
+   the bytes keep idle timeouts (Node's fetch gives up after 300 s of silence,
+   Cloudflare's edge after about 100 s) from closing a long run. The JSON keepalive's
+   bare newline is never written into a stream.
+3. When the CLI finishes, `chat.completion.chunk`s: one with `delta.role` `assistant`,
+   one with the whole text as `delta.content`, one with `finish_reason` `stop`, then
+   `data: [DONE]`. With `stream_options.include_usage`, a last chunk before `[DONE]`
+   carries the estimated `usage` (the same figures a buffered completion reports), and
+   the others carry `usage: null`, as OpenAI does.
+
+A failure after the headers went out (the CLI failed or timed out) is one
+`data: {"error":{"message":…,"type":"bridge_backend_error","id":…}}` event, redacted
+as a buffered error is, and the stream ends with no `[DONE]`. Everything before the
+headers is unchanged: a bad key is still `401`, a busy bridge `429`, and `tools`,
+`response_format`, `n > 1` or content blocks still `400`. A client that disconnects has
+its CLI killed, and `BRIDGE_TIMEOUT_MS` applies as usual. Falsy values (`false`, `null`,
+`0`) keep the single buffered JSON completion.
 
 ### Reasoning effort, per-request, via a model-id suffix (both backends)
 
