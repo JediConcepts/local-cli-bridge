@@ -36,6 +36,8 @@
  *                      heartbeat only for Cloudflare-forwarded requests (header
  *                      heuristic), local requests keep real status codes. 0 never,
  *                      N ms always. See "Cloudflare 524" note on the completions handler.
+ *                      A `stream: true` request is an event stream instead, which
+ *                      always heartbeats with SSE comments, at least every 10 s.
  *   BRIDGE_MAX_BODY_BYTES    request body ceiling (default 10485760 = 10MB, the CLI stdin cap)
  *   BRIDGE_MAX_PROCESS_OUTPUT_BYTES  ceiling on total child output, stdout+stderr+result
  *                      file (default 10485760 = 10MB; breach kills the child → 502)
@@ -216,6 +218,15 @@ const STRIP_ENV_KEYS = [
   "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
   "GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY",
 ];
+// Removed from EVERY child's environment, for every backend, even with
+// BRIDGE_KEEP_ENV_KEYS=1. ANTHROPIC_BASE_URL sends Claude Code (and anything else
+// built on Anthropic's SDK) to a different API host. Left behind in a shell profile
+// by some other tool, or set for a proxy, it would quietly send every prompt the
+// bridge handles (a meeting transcript, say) to that host instead of Anthropic. The
+// bridge's contract is "the CLI you are logged into, talking to its own provider",
+// so this is never passed on: BRIDGE_KEEP_ENV_KEYS keeps a credential on purpose,
+// it is not a way to reroute traffic.
+const ALWAYS_STRIP_ENV_KEYS = ["ANTHROPIC_BASE_URL"];
 
 // ── Reasoning effort via model-id suffix ──────────────────────────────────────
 // Both CLIs take a per-run reasoning effort (Codex: `-c model_reasoning_effort='"high"'`;
@@ -239,6 +250,80 @@ function splitModelEffort(model) {
   return REASONING_EFFORTS.has(effort) ? { id: model.slice(0, i), effort } : { id: model || "", effort: null };
 }
 
+// ── BRIDGE_CLAUDE_ARGS: an allowlist ──────────────────────────────────────────
+// Extra Claude Code arguments may shape a run (model, effort, prompt text, budgets)
+// or narrow it, never widen it. The rule is an ALLOWLIST, because a denylist is only
+// as good as its knowledge of every flag Claude Code has now or adds later:
+//   - every token that starts with "-" must be one of the options below, wherever it
+//     stands, even where a value is expected (`--model --resume` is refused, not read
+//     as a model called "--resume");
+//   - an option takes exactly the values it needs (`--name value` or `--name=value`),
+//     and `--permission-mode` only the modes that ask or deny, never one that grants;
+//   - nothing else may appear: no bare argument, no "--", no short flag.
+// So no extra can give Claude Code tools (--tools, --allowedTools, --mcp-config,
+// --add-dir, --settings, --plugin-dir, --dangerously-skip-permissions,
+// --permission-mode bypassPermissions, ...), turn the safety options off, or resume
+// a session (--resume, --continue, --session-id, ...). A value that breaks the rule
+// is refused when the bridge starts, naming the flag.
+const CLAUDE_EXTRA_OPTIONS = new Map([
+  ["--model", { takes: "value" }],
+  ["--fallback-model", { takes: "value" }],
+  ["--effort", { takes: "value" }],
+  ["--append-system-prompt", { takes: "value" }],
+  ["--system-prompt", { takes: "value" }],
+  ["--max-turns", { takes: "value" }],
+  ["--max-budget-usd", { takes: "value" }],
+  ["--permission-mode", { takes: "value", only: new Set(["default", "manual", "dontAsk", "plan"]) }],
+  ["--disallowedTools", { takes: "values" }],
+  ["--disallowed-tools", { takes: "values" }],
+  ["--strict-mcp-config", { takes: "nothing" }],
+  ["--disable-slash-commands", { takes: "nothing" }],
+  ["--no-chrome", { takes: "nothing" }],
+]);
+
+/** Throw, naming `label` and the offending flag, unless `tokens` keep to the allowlist above. */
+function checkClaudeExtraArgs(tokens, label) {
+  const refuse = (why) => {
+    throw new Error(
+      `${label}: ${why}. The bridge always runs Claude Code with --safe-mode, no tools and no saved ` +
+        `session; extra arguments may only use ${[...CLAUDE_EXTRA_OPTIONS.keys()].join(", ")}`,
+    );
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token.startsWith("-") || token === "-") refuse(`"${token}" is not allowed (a bare argument)`);
+    const eq = token.startsWith("--") ? token.indexOf("=") : -1;
+    const name = eq > 0 ? token.slice(0, eq) : token;
+    const spec = CLAUDE_EXTRA_OPTIONS.get(name);
+    if (!spec) refuse(`"${name}" is not allowed`);
+    if (spec.takes === "nothing") {
+      if (eq > 0) refuse(`"${name}" takes no value`);
+      continue;
+    }
+    const values = [];
+    if (eq > 0) values.push(token.slice(eq + 1));
+    else {
+      // A following token that starts with "-" is an option, checked on its own turn.
+      while (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
+        values.push(tokens[++i]);
+        if (spec.takes === "value") break;
+      }
+    }
+    if (!values.length) refuse(`"${name}" needs a value (write ${name}=<value> for one that starts with "-")`);
+    if (spec.only && !spec.only.has(values[0])) {
+      refuse(`"${name}" may not be "${values[0]}" (only ${[...spec.only].join(", ")})`);
+    }
+  }
+  return tokens;
+}
+
+/** BRIDGE_CLAUDE_ARGS_JSON (exact) or BRIDGE_CLAUDE_ARGS (quoted), checked against the allowlist. */
+function claudeExtraArgs() {
+  const json = process.env.BRIDGE_CLAUDE_ARGS_JSON;
+  const tokens = argsFromEnv({ json, text: process.env.BRIDGE_CLAUDE_ARGS, label: "BRIDGE_CLAUDE_ARGS_JSON" });
+  return checkClaudeExtraArgs(tokens, json !== undefined && json !== "" ? "BRIDGE_CLAUDE_ARGS_JSON" : "BRIDGE_CLAUDE_ARGS");
+}
+
 // ── Backends ──────────────────────────────────────────────────────────────────
 // Each backend maps an OpenAI request → { cmd, args, stdin } and parses the CLI's
 // stdout back to { text, promptTokens, completionTokens }. Backends are finalised
@@ -248,7 +333,8 @@ const BACKENDS = {
   /**
    * Claude Code CLI in headless print mode, one-shot completion, JSON output.
    * Invocation (authoritative, see also docs/LOCAL_BRIDGE.md):
-   *   claude -p --output-format json [--model <m>] [--effort <e>] [--append-system-prompt <s>]
+   *   claude -p --output-format json --safe-mode --no-session-persistence --tools=
+   *     [--model <m>] [--effort <e>] [--append-system-prompt <s>]
    * with the prompt piped on stdin (fine up to Claude Code's 10MB stdin cap).
    * --output-format json → { result, is_error, session_id, ... }. Errors go to stderr +
    * a non-zero exit, which the runner surfaces. No token counts are in the JSON, so the
@@ -256,13 +342,29 @@ const BACKENDS = {
    */
   claude: {
     build({ model, system, prompt, webSearch }) {
-      // Minimal, subscription-friendly invocation. Deliberately NO --bare: it isolates
-      // the run and stops Claude Code from seeing the ~/.claude credentials that
-      // `claude` + `/login` set up ("Not logged in"). The child env also has the
-      // provider API keys stripped (see runBackend) so the CLI uses your subscription
-      // login, not an ANTHROPIC_API_KEY. Add hardening flags (e.g.
-      // --permission-mode dontAsk --max-turns 1) via BRIDGE_CLAUDE_ARGS if wanted.
-      const args = ["-p", "--output-format", "json"];
+      // Subscription-friendly invocation. Deliberately NO --bare: it isolates the run
+      // and stops Claude Code from seeing the ~/.claude credentials that `claude` +
+      // `/login` set up ("Not logged in"). The child env also has the provider API
+      // keys stripped (see runBackend) so the CLI uses your subscription login, not an
+      // ANTHROPIC_API_KEY.
+      //
+      // Three options on EVERY run, whatever the request or the configuration (a
+      // prompt is whatever a caller sent: a meeting transcript, a scraped page):
+      //   --safe-mode               no CLAUDE.md, skills, plugins, hooks, MCP servers
+      //                             or custom agents from this machine's config;
+      //   --tools=                  no built-in tools at all, so nothing in a prompt
+      //                             can get Claude Code to run anything here. A web-
+      //                             search request gets the read-only web tools only;
+      //   --no-session-persistence  the prompt and answer are not saved as a session.
+      // `--tools` is variadic: as a separate token it would swallow every following
+      // argument that does not start with "-". The one-token `--flag=value` form never
+      // does, so it cannot take an argument meant for something else.
+      // BRIDGE_CLAUDE_ARGS cannot undo any of this: see checkClaudeExtraArgs.
+      const args = [
+        "-p", "--output-format", "json",
+        "--safe-mode", "--no-session-persistence",
+        webSearch ? "--tools=WebSearch,WebFetch" : "--tools=",
+      ];
       // The effort suffix drives Claude too: current Claude Code has a first-class
       // `--effort low|medium|high|xhigh|max` (default high) that works in -p mode,
       // so "sonnet:xhigh" → `--model sonnet --effort xhigh`. Values outside Claude's
@@ -275,12 +377,7 @@ const BACKENDS = {
       // Opt-in web search ("web_search": true in the request): only the read-only web
       // tools. One token, so the variadic flag cannot swallow anything after it.
       if (webSearch) args.push("--allowedTools=WebSearch,WebFetch");
-      const extra = argsFromEnv({
-        json: process.env.BRIDGE_CLAUDE_ARGS_JSON,
-        text: process.env.BRIDGE_CLAUDE_ARGS,
-        label: "BRIDGE_CLAUDE_ARGS_JSON",
-      });
-      return { cmd: "claude", args: [...args, ...extra], stdin: prompt };
+      return { cmd: "claude", args: [...args, ...claudeExtraArgs()], stdin: prompt };
     },
     parse(out) {
       const j = JSON.parse(out);
@@ -457,6 +554,7 @@ function runBackend({ model, system, prompt, webSearch = false }, { signal } = {
   if (process.env.BRIDGE_KEEP_ENV_KEYS !== "1") {
     for (const k of STRIP_ENV_KEYS) delete childEnv[k];
   }
+  for (const k of ALWAYS_STRIP_ENV_KEYS) delete childEnv[k];
 
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -634,6 +732,46 @@ function openAiResponse({ model, text, promptTokens, completionTokens }) {
   };
 }
 
+// ── Event streams (`stream: true`) ──────────────────────────────────────────────
+// The CLIs answer in one piece, so a stream is: 200 + text/event-stream at once, SSE
+// comment heartbeats while the CLI runs, then the whole answer as OpenAI chunks: the
+// role, the text as ONE content delta, a stop chunk, a usage chunk when the caller
+// asked for one (stream_options.include_usage), and `data: [DONE]`. A failure after
+// the headers went out is one `data: {"error":{...}}` event, then the stream ends,
+// with no [DONE]. Heartbeats are SSE comments (":" lines, which every SSE parser
+// skips), never the bare newline of the JSON keepalive: in an event stream that is
+// an empty event.
+const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-store" };
+const SSE_COMMENT = ": keepalive\n\n";
+// The longest gap between stream heartbeats. Clients keep an event stream open on
+// bytes arriving: Node's fetch gives up after 300 s of silence, Cloudflare's edge
+// after about 100 s, and some clients far sooner.
+const SSE_HEARTBEAT_MAX_MS = 10_000;
+/** A stream's heartbeat interval: BRIDGE_KEEPALIVE_MS when that is shorter, otherwise SSE_HEARTBEAT_MAX_MS. Never off. */
+function sseHeartbeatMs(keepaliveMs) {
+  return keepaliveMs > 0 ? Math.min(keepaliveMs, SSE_HEARTBEAT_MAX_MS) : SSE_HEARTBEAT_MAX_MS;
+}
+
+/** The `data:` payloads of a finished completion, in order, ending with [DONE]. */
+function streamFrames({ model, text, usage }) {
+  const base = {
+    id: `chatcmpl-bridge-${process.hrtime.bigint().toString(36)}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: model || DEFAULT_MODEL || BACKEND,
+  };
+  // With include_usage, OpenAI puts `usage: null` on every chunk but the last.
+  const chunk = (choices) => JSON.stringify({ ...base, choices, ...(usage ? { usage: null } : {}) });
+  const frames = [
+    chunk([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]),
+    chunk([{ index: 0, delta: { content: text }, finish_reason: null }]),
+    chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+  ];
+  if (usage) frames.push(JSON.stringify({ ...base, choices: [], usage }));
+  frames.push("[DONE]");
+  return frames;
+}
+
 // ── HTTP server ─────────────────────────────────────────────────────────────────
 
 function send(res, status, body) {
@@ -719,14 +857,12 @@ function discoveryAuthOk(req) {
 let activeCompletions = 0;
 
 // OpenAI request features the bridge does NOT implement. Rejecting them loudly beats
-// silently ignoring them, a caller that sets `stream: true` would otherwise wait for
-// SSE that never comes and misread the buffered JSON. An explicit `null` is treated
-// as absent throughout: several OpenAI SDKs serialize unset optionals as null.
+// silently ignoring them, a caller that sets `tools` would otherwise get an answer
+// that never called them. An explicit `null` is treated as absent throughout:
+// several OpenAI SDKs serialize unset optionals as null. (`stream` is supported:
+// see streamFrames.)
 const UNSUPPORTED_FIELDS = ["tools", "tool_choice", "response_format", "functions"];
 function unsupportedFeature(body) {
-  if (body.stream !== undefined && body.stream !== false && body.stream !== null) {
-    return "stream (the bridge returns a single buffered completion)";
-  }
   if (body.n != null && body.n !== 1) return "n > 1";
   for (const f of UNSUPPORTED_FIELDS) if (body[f] != null) return f;
   return null;
@@ -844,18 +980,26 @@ function handleRequest(req, res) {
       // Cloudflare, so the default ("auto") heartbeats per request: requests
       // carrying Cloudflare edge headers get the defence, direct/local requests
       // keep their real status codes (a 504 timeout stays a 504).
+      //
+      // An event stream (`stream: true`) always commits at once and heartbeats in
+      // its own framing, SSE comments, at least every SSE_HEARTBEAT_MAX_MS: the
+      // whitespace heartbeat never touches it (see streamFrames).
       const keepaliveMs = keepaliveMsFor(req);
-      if (KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
+      const stream = Boolean(body.stream);
+      if (!stream && KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
         warnedKeepaliveOffOnTunnel = true;
         log.warn("tunnel-forwarded request with the keepalive disabled: responses slower than ~100s will die with a Cloudflare 524 (set BRIDGE_KEEPALIVE_MS=auto)");
       }
-      if (keepaliveMs > 0) {
+      let beat = null;
+      if (stream) {
+        res.writeHead(200, SSE_HEADERS);
+        res.write(SSE_COMMENT);
+        beat = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write(SSE_COMMENT); }, sseHeartbeatMs(keepaliveMs));
+      } else if (keepaliveMs > 0) {
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
         res.write("\n");
+        beat = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, keepaliveMs);
       }
-      const beat = keepaliveMs > 0
-        ? setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, keepaliveMs)
-        : null;
       let settled = false;
       // A response 'close' before finish() means the CLIENT went away mid-flight
       // (it also fires after a normal end, hence the settled guard): abort the
@@ -874,6 +1018,13 @@ function handleRequest(req, res) {
         if (keepaliveMs > 0) return res.end(JSON.stringify(obj)); // headers already sent
         return send(res, status, obj);
       };
+      // A stream ends with its data events (see streamFrames), then the response ends.
+      const finishStream = (frames) => {
+        settled = true;
+        if (beat) clearInterval(beat);
+        if (res.writableEnded || res.destroyed) return;
+        res.end(frames.map((frame) => `data: ${frame}\n\n`).join(""));
+      };
 
       try {
         const webSearch = body.web_search === true;
@@ -882,17 +1033,20 @@ function handleRequest(req, res) {
           { signal: ac.signal },
         );
         log.info(
-          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""}${webSearch ? " +web" : ""} → ${text.length} chars in ${Date.now() - t0}ms`,
+          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""}${webSearch ? " +web" : ""}${stream ? " stream" : ""} → ${text.length} chars in ${Date.now() - t0}ms`,
         );
-        return finish(
-          200,
-          openAiResponse({
-            model: body.model,
-            text,
-            promptTokens: promptTokens ?? estimateTokens(system + prompt),
-            completionTokens: completionTokens ?? estimateTokens(text),
-          }),
-        );
+        const response = openAiResponse({
+          model: body.model,
+          text,
+          promptTokens: promptTokens ?? estimateTokens(system + prompt),
+          completionTokens: completionTokens ?? estimateTokens(text),
+        });
+        if (stream) {
+          // The same estimate as a buffered completion, when the caller asks for it.
+          const usage = body.stream_options?.include_usage ? response.usage : null;
+          return finishStream(streamFrames({ model: body.model, text, usage }));
+        }
+        return finish(200, response);
       } catch (e) {
         if (e.code === "CLIENT_DISCONNECTED") {
           // The socket is gone, there is nobody to answer; just record it.
@@ -909,9 +1063,12 @@ function handleRequest(req, res) {
         const message = EXPOSE_ERROR_DETAILS || e.safeToExpose ? e.message : "The local model backend failed";
         // A timed-out backend is a gateway timeout; every other backend failure
         // (spawn, non-zero exit, parse) is a bad gateway. With the keepalive
-        // heartbeat active the status is already spent and this arrives in-body.
+        // heartbeat active the status is already spent and this arrives in-body;
+        // in a stream it is the one data event before the stream ends.
         const status = e.code === "BACKEND_TIMEOUT" ? 504 : 502;
-        return finish(status, { error: { message, type: "bridge_backend_error", id: errorId } });
+        const error = { error: { message, type: "bridge_backend_error", id: errorId } };
+        if (stream) return finishStream([JSON.stringify(error)]);
+        return finish(status, error);
       } finally {
         // Settlement-scoped release: runBackend settles only after its child
         // closed, so this can never let a new spawn overlap a dying child.
@@ -972,7 +1129,7 @@ function createBridgeServer() {
 
 // Pure pieces exported for unit tests; importing this module never starts a
 // server or registers signal handlers (see the is-main guard below).
-export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer, BridgeError };
+export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer, BridgeError, sseHeartbeatMs };
 
 // realpath matters: npm installs bin entries as SYMLINKS (node_modules/.bin/…),
 // so argv[1] is the link while import.meta.url is the resolved file — without
@@ -986,7 +1143,25 @@ const IS_MAIN = (() => {
   }
 })();
 
-if (IS_MAIN) {
+// Configuration that would undo the safety options is refused at start, not on the
+// first request: only for backends that can run Claude Code, since the others never
+// read BRIDGE_CLAUDE_ARGS. exitCode rather than exit(): nothing has started, so the
+// process ends by itself once the message is flushed.
+const STARTUP_REFUSAL = (() => {
+  if (!IS_MAIN || (BACKEND !== "claude" && BACKEND !== "auto")) return null;
+  try {
+    claudeExtraArgs();
+    return null;
+  } catch (e) {
+    return e.message;
+  }
+})();
+if (STARTUP_REFUSAL) {
+  log.error(`refusing to start: ${STARTUP_REFUSAL}`);
+  process.exitCode = 1;
+}
+
+if (IS_MAIN && !STARTUP_REFUSAL) {
   const server = createBridgeServer();
 
   // Friendly startup failures: EADDRINUSE is the most common first run collision

@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+// Stand-in for the `claude` and `codex` CLIs (and a `command` backend) that
+// records exactly how the bridge ran it, then answers the way the real CLI's
+// output parser expects. The tests put a `claude` / `codex` shim that execs
+// this script first on the bridge's PATH, so the real CLIs are never run.
+//
+//   node stub-cli.mjs <claude|codex|command> [the argv the bridge passed...]
+//
+// When STUB_RECORD_DIR is set, each run writes <dir>/<name>-<pid>.json with
+//   { name, argv, envKeys, stdin }
+// envKeys holds only the NAMES of the child's environment variables: the
+// tests need to know what was removed, and recording values could copy a
+// real secret from the test runner's environment into a file.
+//
+// Behaviour, from the environment:
+//   STUB_MODE    ok (default) | slow | fail | hang
+//   STUB_MS      delay before answering in `slow` (default 1000)
+//   STUB_TEXT    the answer (default "stub answer")
+//   STUB_MARKER  file written when SIGTERM arrives in `hang`
+//
+// Output per name:
+//   claude   {"type":"result","is_error":false,"result":<text>} on stdout;
+//            `fail` prints {"is_error":true,"result":<text>} and exits 1
+//   codex    writes <text> to the --output-last-message file
+//   command  writes <text> to stdout
+
+import fs from "node:fs";
+import path from "node:path";
+
+const [name = "command", ...argv] = process.argv.slice(2);
+const mode = process.env.STUB_MODE || "ok";
+const text = process.env.STUB_TEXT ?? "stub answer";
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => (data += d));
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", () => resolve(data));
+  });
+}
+
+function flushWrite(stream, data) {
+  return new Promise((r) => stream.write(data, r));
+}
+
+const stdin = await readStdin();
+
+if (process.env.STUB_RECORD_DIR) {
+  const record = { name, argv, envKeys: Object.keys(process.env).sort(), stdin };
+  fs.writeFileSync(path.join(process.env.STUB_RECORD_DIR, `${name}-${process.pid}.json`), JSON.stringify(record));
+}
+
+if (mode === "hang") {
+  process.on("SIGTERM", () => {
+    if (process.env.STUB_MARKER) {
+      try { fs.writeFileSync(process.env.STUB_MARKER, "sigterm"); } catch { /* best effort */ }
+    }
+    process.exit(0);
+  });
+  setInterval(() => {}, 60_000);
+} else {
+  if (mode === "slow") await new Promise((r) => setTimeout(r, Number(process.env.STUB_MS ?? 1000)));
+  if (name === "claude") {
+    const failed = mode === "fail";
+    await flushWrite(process.stdout, JSON.stringify({ type: "result", is_error: failed, result: text, session_id: "stub" }));
+    process.exit(failed ? 1 : 0);
+  } else if (name === "codex") {
+    const i = argv.indexOf("--output-last-message");
+    if (i >= 0 && argv[i + 1]) fs.writeFileSync(argv[i + 1], text);
+    process.exit(mode === "fail" ? 1 : 0);
+  } else {
+    if (mode === "fail") {
+      await flushWrite(process.stderr, `${text}\n`);
+      process.exit(1);
+    }
+    await flushWrite(process.stdout, text);
+    process.exit(0);
+  }
+}

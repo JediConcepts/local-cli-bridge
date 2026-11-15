@@ -109,11 +109,13 @@ test("non-string message content (content blocks) is a 400", async () => {
   assert.ok(body.error.message.includes("content"));
 });
 
-test("unsupported features are rejected loudly: stream true is a 400", async () => {
-  const res = await completion({ model: "echo-1", stream: true, messages: [{ role: "user", content: "hi" }] });
-  assert.equal(res.status, 400);
-  const body = await res.json();
-  assert.ok(body.error.message.includes("stream"));
+test("stream: true is answered with an event stream, not a 400", async () => {
+  const res = await completion({ model: "echo-1", stream: true, messages: [{ role: "user", content: "streamed-hi" }] });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /^text\/event-stream/);
+  const text = await res.text();
+  assert.ok(text.includes("streamed-hi"));
+  assert.ok(text.trimEnd().endsWith("data: [DONE]"));
 });
 
 for (const [field, value] of [
@@ -135,9 +137,11 @@ test("n > 1 is a 400 (the bridge returns exactly one choice)", async () => {
   assert.equal(res.status, 400);
 });
 
-test('stream: "true" (a truthy non-boolean) is rejected, not silently buffered', async () => {
+test('stream: "true" (a truthy non-boolean) streams, not silently buffered', async () => {
   const res = await completion({ model: "echo-1", stream: "true", messages: [{ role: "user", content: "hi" }] });
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /^text\/event-stream/);
+  await res.text();
 });
 
 test("explicit nulls from SDK serializers are treated as absent, not rejected", async () => {

@@ -83,7 +83,10 @@ test("model-id effort suffixes split only on known effort values", () => {
 test("claude build: model, effort, and system flags land in argv, prompt on stdin", () => {
   const { cmd, args, stdin } = BACKENDS.claude.build({ model: "sonnet:xhigh", system: "SYS", prompt: "hello" });
   assert.equal(cmd, "claude");
-  assert.deepEqual(args, ["-p", "--output-format", "json", "--model", "sonnet", "--effort", "xhigh", "--append-system-prompt", "SYS"]);
+  assert.deepEqual(args, [
+    "-p", "--output-format", "json", "--safe-mode", "--no-session-persistence", "--tools=",
+    "--model", "sonnet", "--effort", "xhigh", "--append-system-prompt", "SYS",
+  ]);
   assert.equal(stdin, "hello");
 });
 
@@ -94,16 +97,127 @@ test("claude build: effort values outside Claude's vocabulary are stripped", () 
 });
 
 test("claude build: quoted BRIDGE_CLAUDE_ARGS survive as single argv entries", () => {
-  process.env.BRIDGE_CLAUDE_ARGS = '--permission-mode dontAsk --add-dir "/tmp/with space"';
+  process.env.BRIDGE_CLAUDE_ARGS = '--permission-mode dontAsk --append-system-prompt "be very brief"';
   const { args } = BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" });
-  assert.deepEqual(args.slice(-4), ["--permission-mode", "dontAsk", "--add-dir", "/tmp/with space"]);
+  assert.deepEqual(args.slice(-4), ["--permission-mode", "dontAsk", "--append-system-prompt", "be very brief"]);
 });
 
 test("claude build: BRIDGE_CLAUDE_ARGS_JSON wins over BRIDGE_CLAUDE_ARGS", () => {
   process.env.BRIDGE_CLAUDE_ARGS = "--ignored entirely";
-  process.env.BRIDGE_CLAUDE_ARGS_JSON = '["--exact","a b"]';
+  process.env.BRIDGE_CLAUDE_ARGS_JSON = '["--fallback-model","a b"]';
   const { args } = BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" });
-  assert.deepEqual(args.slice(-2), ["--exact", "a b"]);
+  assert.deepEqual(args.slice(-2), ["--fallback-model", "a b"]);
+});
+
+// ── claude backend: the safety options on every run ─────────────────────────
+
+test("claude build: every run has --safe-mode, --no-session-persistence and an empty tools list", () => {
+  for (const request of [
+    { model: "sonnet", system: "", prompt: "p" },
+    { model: "", system: "SYS", prompt: "p" },
+    { model: "opus:max", system: "SYS", prompt: "p" },
+  ]) {
+    const { args } = BACKENDS.claude.build(request);
+    assert.equal(args.filter((a) => a === "--safe-mode").length, 1, "--safe-mode exactly once");
+    assert.equal(args.filter((a) => a === "--no-session-persistence").length, 1, "--no-session-persistence exactly once");
+    assert.deepEqual(args.filter((a) => a.startsWith("--tools")), ["--tools="], "one empty tools list");
+    assert.ok(!args.some((a) => /allowed-?tools/i.test(a)), "no allowed tools on a normal request");
+  }
+});
+
+test("claude build: a web-search request gets WebSearch and WebFetch as its only tools", () => {
+  const { args } = BACKENDS.claude.build({ model: "sonnet", system: "SYS", prompt: "p", webSearch: true });
+  assert.ok(args.includes("--safe-mode"));
+  assert.ok(args.includes("--no-session-persistence"));
+  assert.deepEqual(args.filter((a) => a.startsWith("--tools")), ["--tools=WebSearch,WebFetch"]);
+  assert.deepEqual(args.filter((a) => /allowed-?tools/i.test(a)), ["--allowedTools=WebSearch,WebFetch"]);
+});
+
+test("claude build: the variadic tool flags are single tokens, so they cannot swallow a later argument", () => {
+  // `--tools <tools...>` and `--allowedTools <tools...>` are variadic in Claude
+  // Code's parser: a separate-token form consumes every following argument that
+  // does not start with "-". The `--flag=value` form never does.
+  process.env.BRIDGE_CLAUDE_ARGS = "--model sonnet";
+  for (const webSearch of [false, true]) {
+    const { args } = BACKENDS.claude.build({ model: "opus", system: "SYS", prompt: "p", webSearch });
+    for (const bare of ["--tools", "--allowedTools", "--allowed-tools"]) {
+      assert.ok(!args.includes(bare), `${bare} must not be a separate token`);
+    }
+  }
+});
+
+test("claude build: the prompt goes on stdin, never into argv", () => {
+  const { args, stdin } = BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "a spoken sentence" });
+  assert.equal(stdin, "a spoken sentence");
+  assert.ok(!args.includes("a spoken sentence"));
+});
+
+// ── BRIDGE_CLAUDE_ARGS cannot undo the safety options ──────────────────────
+
+test("BRIDGE_CLAUDE_ARGS that would give Claude Code tools, undo the options or resume a session are refused, naming the flag", () => {
+  const refused = [
+    ["--tools", "Bash"], ["--tools=Bash"], ["--tools=default"], ["--tools", ""],
+    ["--allowedTools", "Bash"], ["--allowedTools=Bash"], ["--allowed-tools", "Bash"], ["--allowed-tools=Bash"],
+    ["--dangerously-skip-permissions"], ["--allow-dangerously-skip-permissions"],
+    ["--permission-mode", "bypassPermissions"], ["--permission-mode=bypassPermissions"],
+    ["--permission-mode", "acceptEdits"], ["--permission-mode", "auto"],
+    ["--mcp-config", "/tmp/mcp.json"], ["--mcp-config={}"], ["--add-dir", "/"], ["--add-dir=/"],
+    ["--settings", "{}"], ["--plugin-dir", "/tmp/p"], ["--agents", "{}"],
+    ["--resume", "abc"], ["-r", "abc"], ["--continue"], ["-c"], ["--session-id", "0b0c0d0e-0000-4000-8000-000000000000"],
+    ["--fork-session"], ["--from-pr", "1"], ["--teleport"],
+    ["--session-persistence"], ["--no-safe-mode"], ["--debug"], ["--debug-file", "/tmp/d"],
+    ["-pc"], ["--"], ["a-bare-argument"],
+  ];
+  for (const extra of refused) {
+    process.env.BRIDGE_CLAUDE_ARGS_JSON = JSON.stringify(extra);
+    assert.throws(
+      () => BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" }),
+      (e) => e.message.includes("BRIDGE_CLAUDE_ARGS_JSON") && e.message.includes(`"${extra[0].split("=")[0]}"`),
+      `extra args ${JSON.stringify(extra)} must be refused, naming the flag`,
+    );
+  }
+});
+
+test("BRIDGE_CLAUDE_ARGS: a refused flag hidden after allowed ones, or in a value's place, is still refused", () => {
+  for (const extra of [
+    ["--max-turns", "1", "--dangerously-skip-permissions"],
+    ["--model", "--dangerously-skip-permissions"],
+    ["--disallowedTools", "Bash", "--tools=Bash"],
+  ]) {
+    process.env.BRIDGE_CLAUDE_ARGS_JSON = JSON.stringify(extra);
+    assert.throws(() => BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" }), /BRIDGE_CLAUDE_ARGS_JSON/);
+  }
+});
+
+test("BRIDGE_CLAUDE_ARGS (the quoted form) is checked the same way, naming that variable", () => {
+  process.env.BRIDGE_CLAUDE_ARGS = "--permission-mode dontAsk --dangerously-skip-permissions";
+  assert.throws(
+    () => BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" }),
+    (e) => /BRIDGE_CLAUDE_ARGS\b/.test(e.message) && !e.message.includes("_JSON") && e.message.includes("--dangerously-skip-permissions"),
+  );
+});
+
+test("BRIDGE_CLAUDE_ARGS: options that only shape or narrow the run are accepted", () => {
+  for (const extra of [
+    ["--permission-mode", "dontAsk", "--max-turns", "1"],
+    ["--permission-mode=plan"], ["--permission-mode", "default"], ["--permission-mode", "manual"],
+    ["--model", "opus"], ["--fallback-model", "sonnet"], ["--effort", "low"],
+    ["--append-system-prompt", "be very brief"], ["--system-prompt=You write minutes."],
+    ["--max-budget-usd", "1"],
+    ["--disallowedTools", "Bash", "Edit"], ["--disallowed-tools=Bash"],
+    ["--strict-mcp-config", "--disable-slash-commands", "--no-chrome"],
+  ]) {
+    process.env.BRIDGE_CLAUDE_ARGS_JSON = JSON.stringify(extra);
+    const { args } = BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" });
+    assert.deepEqual(args.slice(-extra.length), extra, `extra args ${JSON.stringify(extra)} must pass through`);
+  }
+});
+
+test("BRIDGE_CLAUDE_ARGS: an option missing its value is refused", () => {
+  for (const extra of [["--model"], ["--permission-mode"], ["--disallowedTools"]]) {
+    process.env.BRIDGE_CLAUDE_ARGS_JSON = JSON.stringify(extra);
+    assert.throws(() => BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" }), /value/);
+  }
 });
 
 test("claude parse: result text, is_error, and non-string results", () => {
