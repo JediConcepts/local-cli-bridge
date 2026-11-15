@@ -16,7 +16,9 @@
 //   STUB_MODE    ok (default) | slow | fail | hang
 //   STUB_MS      delay before answering in `slow` (default 1000)
 //   STUB_TEXT    the answer (default "stub answer")
-//   STUB_MARKER  file written when SIGTERM arrives in `hang`
+//   STUB_MARKER  file written when SIGTERM arrives in `hang`; <marker>.ready is
+//                written once the SIGTERM handler is in place, so a test can
+//                wait for that instead of guessing how long start-up takes
 //
 // Output per name:
 //   claude   {"type":"result","is_error":false,"result":<text>} on stdout;
@@ -45,6 +47,19 @@ function flushWrite(stream, data) {
   return new Promise((r) => stream.write(data, r));
 }
 
+// In `hang`, catch SIGTERM before anything else: a signal that arrived while
+// stdin was still being read would otherwise end the process by the default
+// action, with no marker, and look like a bridge that never sent it.
+if (mode === "hang") {
+  process.on("SIGTERM", () => {
+    if (process.env.STUB_MARKER) {
+      try { fs.writeFileSync(process.env.STUB_MARKER, "sigterm"); } catch { /* best effort */ }
+    }
+    process.exit(0);
+  });
+  if (process.env.STUB_MARKER) fs.writeFileSync(`${process.env.STUB_MARKER}.ready`, String(process.pid));
+}
+
 const stdin = await readStdin();
 
 if (process.env.STUB_RECORD_DIR) {
@@ -53,12 +68,6 @@ if (process.env.STUB_RECORD_DIR) {
 }
 
 if (mode === "hang") {
-  process.on("SIGTERM", () => {
-    if (process.env.STUB_MARKER) {
-      try { fs.writeFileSync(process.env.STUB_MARKER, "sigterm"); } catch { /* best effort */ }
-    }
-    process.exit(0);
-  });
   setInterval(() => {}, 60_000);
 } else {
   if (mode === "slow") await new Promise((r) => setTimeout(r, Number(process.env.STUB_MS ?? 1000)));

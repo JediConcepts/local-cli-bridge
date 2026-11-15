@@ -53,6 +53,12 @@ function parseSse(text) {
   };
 }
 
+async function waitForFile(file, ms, message) {
+  const deadline = Date.now() + ms;
+  while (!fs.existsSync(file) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  assert.ok(fs.existsSync(file), message);
+}
+
 async function claudeBridge(env = {}) {
   const stub = makeStubBin();
   const bridge = await startBridge({ BRIDGE_BACKEND: "claude", BRIDGE_API_KEY: KEY, ...stub.env, ...env });
@@ -235,14 +241,19 @@ test("a client that disconnects from a stream has its CLI child killed", async (
     const ac = new AbortController();
     const res = await post(bridge.base, { model: "sonnet", stream: true, messages: MESSAGES }, { signal: ac.signal });
     assert.equal(res.status, 200);
-    await new Promise((r) => setTimeout(r, 400)); // the child is running and hanging
+    // Wait until the child is running with its SIGTERM handler in place, not a
+    // fixed time: under load, Node start-up alone can take longer than any guess.
+    await waitForFile(`${marker}.ready`, 15_000, "the stub child never started");
     ac.abort();
-    const deadline = Date.now() + 4000;
-    while (!fs.existsSync(marker) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-    assert.ok(fs.existsSync(marker), "the hanging child never got SIGTERM");
+    await waitForFile(marker, 4000, "the hanging child never got SIGTERM");
   } finally {
     bridge.stop();
-    try { fs.unlinkSync(marker); } catch { /* not created */ }
+    // A child the bridge failed to end would hang for ever: end it here (its pid
+    // is in the ready file). With the marker written, it has already exited.
+    if (!fs.existsSync(marker)) {
+      try { process.kill(Number(fs.readFileSync(`${marker}.ready`, "utf8")), "SIGKILL"); } catch { /* never started, or gone */ }
+    }
+    for (const f of [marker, `${marker}.ready`]) try { fs.unlinkSync(f); } catch { /* not created */ }
   }
 });
 
