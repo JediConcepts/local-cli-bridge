@@ -5,7 +5,7 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.BRIDGE_ENV_FILE = "/dev/null"; // isolate from any local .env files
-const { BACKENDS, foldMessages, splitModelEffort } = await import("../scripts/local-cli-bridge.mjs");
+const { BACKENDS, foldMessages, splitModelEffort, codexDisablesFrom, checkExtraArgs, CODEX_EXTRA_OPTIONS } = await import("../scripts/local-cli-bridge.mjs");
 
 const ARG_VARS = [
   "BRIDGE_CLAUDE_ARGS", "BRIDGE_CLAUDE_ARGS_JSON",
@@ -250,32 +250,32 @@ test("claude parse: result text, is_error, and non-string results", () => {
 // ── codex backend ───────────────────────────────────────────────────────────
 
 test("codex build: system text is prepended to the piped prompt, not dropped", () => {
-  const { cmd, args, stdin, resultFile } = BACKENDS.codex.build({ model: "gpt-5.5", system: "SYS", prompt: "hello" });
+  const { cmd, args, stdin, resultFile } = BACKENDS.codex.build({ model: "gpt-5.5", system: "SYS", prompt: "hello", codexDisable: [] });
   assert.equal(cmd, "codex");
   assert.equal(stdin, "SYS\n\nhello");
   assert.ok(resultFile, "codex writes its answer to a result file");
-  assert.deepEqual(args.slice(0, 5), ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check"]);
+  assert.deepEqual(args.slice(0, 7), ["exec", "--ephemeral", "--sandbox", "read-only", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]);
   assert.ok(args.includes("--output-last-message"));
-  assert.deepEqual(args.slice(-2), ["--model", "gpt-5.5"]);
+  assert.deepEqual(args.slice(-1), ["--model=gpt-5.5"]);
 });
 
 test("codex build: concurrent builds get distinct result files", () => {
-  const a = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" });
-  const b = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" });
+  const a = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", codexDisable: [] });
+  const b = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", codexDisable: [] });
   assert.notEqual(a.resultFile, b.resultFile, "same-millisecond completions must not share a result file");
 });
 
 test("codex build: no system means the prompt is piped unchanged", () => {
-  const { stdin } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "bare" });
+  const { stdin } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "bare", codexDisable: [] });
   assert.equal(stdin, "bare");
 });
 
 test("codex build: effort suffix becomes a TOML -c override with inner quotes", () => {
-  const { args } = BACKENDS.codex.build({ model: "gpt-5.6-sol:high", system: "", prompt: "p" });
-  const i = args.indexOf("-c");
+  const { args } = BACKENDS.codex.build({ model: "gpt-5.6-sol:high", system: "", prompt: "p", codexDisable: [] });
+  const i = args.lastIndexOf("-c");
   assert.ok(i > 0);
   assert.equal(args[i + 1], 'model_reasoning_effort="high"');
-  assert.ok(args.includes("gpt-5.6-sol"));
+  assert.ok(args.includes("--model=gpt-5.6-sol"));
 });
 
 test("codex parse: clean result-file content is returned as-is", () => {
@@ -313,7 +313,7 @@ test("command build: fails loudly when neither template variable is set", () => 
 
 test("web search is off unless the request asks for it", () => {
   assert.ok(!BACKENDS.claude.build({ model: "sonnet", system: "", prompt: "p" }).args.some((a) => a.includes("allowedTools")));
-  assert.ok(!BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" }).args.includes("--search"));
+  assert.ok(!BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", codexDisable: [] }).args.includes("--search"));
 });
 
 test("claude build: webSearch allows only the read-only web tools, as one argv entry", () => {
@@ -323,6 +323,42 @@ test("claude build: webSearch allows only the read-only web tools, as one argv e
 });
 
 test("codex build: webSearch puts the top-level --search flag before exec", () => {
-  const { args } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", webSearch: true });
+  const { args } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", codexDisable: [], webSearch: true });
   assert.deepEqual(args.slice(0, 2), ["--search", "exec"]);
+});
+
+// ── codex: the feature list and the fail-closed rule ─────────────────────────
+
+test("codex build: refuses to build a run without the feature list", () => {
+  assert.throws(() => BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p" }), /refusing to run Codex/);
+});
+
+test("codex build: every listed feature becomes a --disable pair", () => {
+  const { args } = BACKENDS.codex.build({ model: "gpt-5.5", system: "", prompt: "p", codexDisable: ["shell_tool", "apps"] });
+  const i = args.indexOf("--disable");
+  assert.deepEqual(args.slice(i, i + 4), ["--disable", "shell_tool", "--disable", "apps"]);
+});
+
+test("codexDisablesFrom: disables all but removed and allowlisted features, enabled or not", () => {
+  const listing = [
+    "shell_tool                               stable             true",
+    "chronicle                                under development  false",
+    "collaboration_modes                      removed            true",
+    "guardianv2.thread_context                under development  true",
+    "enable_request_compression               stable             true",
+  ].join("\n");
+  assert.deepEqual(codexDisablesFrom(listing), ["shell_tool", "chronicle", "guardianv2.thread_context"]);
+});
+
+test("codexDisablesFrom: an empty or unexpected listing throws rather than disabling nothing", () => {
+  assert.throws(() => codexDisablesFrom(""), /empty/);
+  assert.throws(() => codexDisablesFrom("Usage: codex features list"), /unexpected line/);
+});
+
+test("checkExtraArgs: -c accepts only the output settings, as plain words", () => {
+  const ok = (t) => checkExtraArgs(t, "X", CODEX_EXTRA_OPTIONS, "codex");
+  assert.doesNotThrow(() => ok(["-c", 'model_reasoning_effort="high"', "--model=gpt-5.5", "-m", "o3"]));
+  assert.throws(() => ok(["-c", "model_verbosity=[1]"]), /plain word/);
+  assert.throws(() => ok(["-c", 'mcp_servers.x.command="sh"']), /plain word|only/);
+  assert.throws(() => ok(["-c", "model_provider=oss"]), /only model_reasoning_effort/);
 });

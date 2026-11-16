@@ -24,7 +24,7 @@ export function makeStubBin() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stub-bin-"));
   const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stub-records-"));
   const quote = (s) => `'${s.replaceAll("'", "'\\''")}'`;
-  for (const name of ["claude", "codex"]) {
+  for (const name of ["claude", "codex", "fm"]) {
     const shim = path.join(dir, name);
     fs.writeFileSync(shim, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(STUB_CLI)} ${name} "$@"\n`);
     fs.chmodSync(shim, 0o755);

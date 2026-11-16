@@ -60,6 +60,36 @@ if (mode === "hang") {
   if (process.env.STUB_MARKER) fs.writeFileSync(`${process.env.STUB_MARKER}.ready`, String(process.pid));
 }
 
+// `codex features list` is read by the bridge before a Codex run, with no
+// prompt. STUB_FEATURES is the table to print (the real CLI's layout: name,
+// stage, effective state); STUB_FEATURES_MODE=fail makes the listing fail.
+// The run is recorded as "codexfeatures" so it never counts as a `codex` run.
+if (name === "codex" && argv[0] === "features" && argv[1] === "list") {
+  if (process.env.STUB_RECORD_DIR) {
+    const record = { name: "codexfeatures", argv, envKeys: Object.keys(process.env).sort(), stdin: "" };
+    fs.writeFileSync(path.join(process.env.STUB_RECORD_DIR, `codexfeatures-${process.pid}.json`), JSON.stringify(record));
+  }
+  if (process.env.STUB_FEATURES_MODE === "fail") {
+    await flushWrite(process.stderr, "Error: could not load features\n");
+    process.exit(1);
+  }
+  const table = process.env.STUB_FEATURES ?? [
+    "shell_tool                               stable             true",
+    "unified_exec                             stable             true",
+    "apps                                     stable             true",
+    "plugins                                  stable             true",
+    "hooks                                    stable             true",
+    "computer_use                             stable             true",
+    "image_generation                         stable             true",
+    "chronicle                                under development  false",
+    "collaboration_modes                      removed            true",
+    "enable_request_compression               stable             true",
+    "unbounded_connection_retries             stable             true",
+  ].join("\n");
+  await flushWrite(process.stdout, `${table}\n`);
+  process.exit(0);
+}
+
 const stdin = await readStdin();
 
 if (process.env.STUB_RECORD_DIR) {
