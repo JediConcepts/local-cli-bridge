@@ -202,6 +202,10 @@ Three consequences to know about:
 - If your tunnel arrangement somehow strips the Cloudflare headers before they reach the
   bridge, `auto` would treat that traffic as local and long calls would 524 again —
   verify with one long request, and force a numeric interval if needed.
+- A streamed request (`stream: true`) needs none of this, local or tunnelled: it commits
+  to a 200 at once and heartbeats with SSE comments at least every 10 s. A late failure
+  is a `data: {"error":{...}}` event, with no `[DONE]` after it. See
+  [Streaming](./LOCAL_BRIDGE.md#streaming).
 
 After updating the bridge script on the workstation, **restart the bridge process** to pick
 up the change.

@@ -35,6 +35,7 @@ jobs:
           node --check scripts/lib/parse-argv.mjs
           node --check tests/helpers.mjs
           node --check tests/fixtures/fake-cli.mjs
+          node --check tests/fixtures/stub-cli.mjs
 
       - name: Smoke tests
         run: npm test

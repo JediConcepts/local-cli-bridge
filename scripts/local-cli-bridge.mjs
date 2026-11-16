@@ -23,7 +23,7 @@
  * Env:
  *   PORT               (default 8787)
  *   HOST               (default 127.0.0.1, loopback; set 0.0.0.0 only if you must)
- *   BRIDGE_BACKEND     claude | codex | command | auto
+ *   BRIDGE_BACKEND     claude | codex | apple | command | auto
  *   BRIDGE_COMMAND     for backend=command: a quoted command template ({model} is
  *                      substituted, the system+prompt text is written to the process
  *                      stdin). Quoting supported via lib/parse-argv.mjs — no shell.
@@ -36,6 +36,8 @@
  *                      heartbeat only for Cloudflare-forwarded requests (header
  *                      heuristic), local requests keep real status codes. 0 never,
  *                      N ms always. See "Cloudflare 524" note on the completions handler.
+ *                      A `stream: true` request is an event stream instead, which
+ *                      always heartbeats with SSE comments, at least every 10 s.
  *   BRIDGE_MAX_BODY_BYTES    request body ceiling (default 10485760 = 10MB, the CLI stdin cap)
  *   BRIDGE_MAX_PROCESS_OUTPUT_BYTES  ceiling on total child output, stdout+stderr+result
  *                      file (default 10485760 = 10MB; breach kills the child → 502)
@@ -55,14 +57,14 @@
  *
  * Reasoning effort: request model "<id>:<effort>" and the bridge maps it per backend,
  *   "gpt-5.6-sol:high" → codex exec --model gpt-5.6-sol -c model_reasoning_effort="high"
- *   "sonnet:xhigh"     → claude -p --model sonnet --effort xhigh
+ *   "sonnet:xhigh"     → claude -p --model=sonnet --effort=xhigh
  * Advertise the variants you want via BRIDGE_MODELS. Effort values a backend doesn't
  * support are stripped and ignored (Claude accepts low|medium|high|xhigh|max).
  */
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -143,8 +145,10 @@ const EXPOSE_ERROR_DETAILS = process.env.BRIDGE_EXPOSE_ERROR_DETAILS === "1";
 const DEFAULT_MODELS_BY_BACKEND = {
   claude: "opus,sonnet,haiku",
   // Codex model slugs vary per install (gpt-5.5, gpt-5.6-sol/terra, …), so don't guess,
-  // set BRIDGE_MODELS to your real slugs, or leave blank and Codex uses its config default.
+  // set BRIDGE_MODELS to your real slugs, or leave blank and Codex uses its built-in default
+  // (the bridge runs it with --ignore-user-config, so config.toml's model is not read).
   codex: "",
+  apple: "system",
   command: "",
   // auto: one bridge serving BOTH, advertises Claude's models by default; add your
   // Codex slugs with BRIDGE_MODELS="opus,sonnet,haiku,gpt-5.5".
@@ -216,6 +220,40 @@ const STRIP_ENV_KEYS = [
   "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
   "GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY",
 ];
+// Removed from EVERY child's environment, for every backend, even with
+// BRIDGE_KEEP_ENV_KEYS=1. ANTHROPIC_BASE_URL sends Claude Code (and anything else
+// built on Anthropic's SDK) to a different API host. Left behind in a shell profile
+// by some other tool, or set for a proxy, it would quietly send every prompt the
+// bridge handles (a meeting transcript, say) to that host instead of Anthropic. The
+// bridge's contract is "the CLI you are logged into, talking to its own provider",
+// so this is never passed on: BRIDGE_KEEP_ENV_KEYS keeps a credential on purpose,
+// it is not a way to reroute traffic.
+// The same holds for Codex: OPENAI_BASE_URL (and the older OPENAI_API_BASE) points
+// OpenAI's clients at another host, and the Codex binary also reads
+// CODEX_EXEC_SERVER_URL and CODEX_URL, which point it at another server. None of
+// them reaches a child.
+const ALWAYS_STRIP_ENV_KEYS = [
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_EXEC_SERVER_URL", "CODEX_URL",
+  // Certificate-authority overrides, and the switch that turns TLS verification off.
+  // Each lets an intercepting proxy present its own certificate for the provider's
+  // host and read every prompt in clear. A proxy that only relays TLS (HTTPS_PROXY)
+  // needs none of them, so it still works. Names from the Codex and Claude Code
+  // binaries and the usual OpenSSL, Node, curl and Python ones.
+  "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE",
+  "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
+  "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+];
+
+/** A child's environment: the bridge's own, less the keys above. */
+function childEnvironment() {
+  const env = { ...process.env };
+  if (process.env.BRIDGE_KEEP_ENV_KEYS !== "1") {
+    for (const k of STRIP_ENV_KEYS) delete env[k];
+  }
+  for (const k of ALWAYS_STRIP_ENV_KEYS) delete env[k];
+  return env;
+}
 
 // ── Reasoning effort via model-id suffix ──────────────────────────────────────
 // Both CLIs take a per-run reasoning effort (Codex: `-c model_reasoning_effort='"high"'`;
@@ -239,6 +277,195 @@ function splitModelEffort(model) {
   return REASONING_EFFORTS.has(effort) ? { id: model.slice(0, i), effort } : { id: model || "", effort: null };
 }
 
+// ── BRIDGE_CLAUDE_ARGS: an allowlist ──────────────────────────────────────────
+// Extra Claude Code arguments may shape a run (model, effort, prompt text, budgets)
+// or narrow it, never widen it. The rule is an ALLOWLIST, because a denylist is only
+// as good as its knowledge of every flag Claude Code has now or adds later:
+//   - every token that starts with "-" must be one of the options below, wherever it
+//     stands, even where a value is expected (`--model --resume` is refused, not read
+//     as a model called "--resume");
+//   - an option takes exactly the values it needs (`--name value` or `--name=value`),
+//     and `--permission-mode` only the modes that ask or deny, never one that grants;
+//   - nothing else may appear: no bare argument, no "--", no short flag.
+// So no extra can give Claude Code tools (--tools, --allowedTools, --mcp-config,
+// --add-dir, --settings, --plugin-dir, --dangerously-skip-permissions,
+// --permission-mode bypassPermissions, ...), turn the safety options off, or resume
+// a session (--resume, --continue, --session-id, ...). A value that breaks the rule
+// is refused when the bridge starts, naming the flag.
+const CLAUDE_EXTRA_OPTIONS = new Map([
+  ["--model", { takes: "value" }],
+  ["--fallback-model", { takes: "value" }],
+  ["--effort", { takes: "value" }],
+  ["--append-system-prompt", { takes: "value" }],
+  ["--system-prompt", { takes: "value" }],
+  ["--max-turns", { takes: "value" }],
+  ["--max-budget-usd", { takes: "value" }],
+  ["--permission-mode", { takes: "value", only: new Set(["default", "manual", "dontAsk", "plan"]) }],
+  ["--disallowedTools", { takes: "values" }],
+  ["--disallowed-tools", { takes: "values" }],
+  ["--strict-mcp-config", { takes: "nothing" }],
+  ["--disable-slash-commands", { takes: "nothing" }],
+  ["--no-chrome", { takes: "nothing" }],
+]);
+
+/** Throw, naming `label` and the offending flag, unless `tokens` keep to the allowlist above. */
+function checkClaudeExtraArgs(tokens, label) {
+  return checkExtraArgs(tokens, label, CLAUDE_EXTRA_OPTIONS, "Claude Code with --safe-mode, no tools and no saved session");
+}
+
+/**
+ * The allowlist rule shared by BRIDGE_CLAUDE_ARGS and BRIDGE_CODEX_ARGS: every token
+ * is an option from `options` (long `--name value` / `--name=value`, or a short
+ * option written as its own token), taking exactly the values its spec allows.
+ * `only` limits a value to a set; `check(value)` returns a reason to refuse, or "".
+ */
+function checkExtraArgs(tokens, label, options, runsWith) {
+  const refuse = (why) => {
+    throw new Error(
+      `${label}: ${why}. The bridge always runs ${runsWith}; ` +
+        `extra arguments may only use ${[...options.keys()].join(", ")}`,
+    );
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token.startsWith("-") || token === "-") refuse(`"${token}" is not allowed (a bare argument)`);
+    const eq = token.startsWith("--") ? token.indexOf("=") : -1;
+    const name = eq > 0 ? token.slice(0, eq) : token;
+    const spec = options.get(name);
+    if (!spec) refuse(`"${name}" is not allowed`);
+    if (spec.takes === "nothing") {
+      if (eq > 0) refuse(`"${name}" takes no value`);
+      continue;
+    }
+    const values = [];
+    if (eq > 0) values.push(token.slice(eq + 1));
+    else {
+      // A following token that starts with "-" is an option, checked on its own turn.
+      while (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
+        values.push(tokens[++i]);
+        if (spec.takes === "value") break;
+      }
+    }
+    if (!values.length) refuse(`"${name}" needs a value (write ${name}=<value> for one that starts with "-")`);
+    for (const value of values) {
+      if (spec.only && !spec.only.has(value)) {
+        refuse(`"${name}" may not be "${value}" (only ${[...spec.only].join(", ")})`);
+      }
+      const why = spec.check ? spec.check(value) : "";
+      if (why) refuse(`"${name}" may not be "${value}" (${why})`);
+    }
+  }
+  return tokens;
+}
+
+// ── BRIDGE_CODEX_ARGS: an allowlist ───────────────────────────────────────────
+// The same rule for Codex. Extra arguments may pick the model, tune its output, or
+// turn more features off. They may never turn a feature on (--enable), widen the
+// sandbox (--sandbox, -s, --full-auto, --dangerously-*), reach more files
+// (--add-dir, --cd), load a profile or a local model server (--profile, --oss), or
+// override config with -c, except the three output settings named below, whose
+// values are a word or a quoted word: no table, no array, nothing that could carry
+// a command, a path or a URL.
+const CODEX_SAFE_CONFIG_KEYS = new Set(["model_reasoning_effort", "model_reasoning_summary", "model_verbosity"]);
+function checkCodexConfigValue(value) {
+  const m = /^([a-z_]+)=("?)([A-Za-z0-9_.-]+)\2$/.exec(value);
+  if (!m) return "write key=value with a plain word as the value";
+  if (!CODEX_SAFE_CONFIG_KEYS.has(m[1])) return `only ${[...CODEX_SAFE_CONFIG_KEYS].join(", ")} may be set`;
+  return "";
+}
+const CODEX_EXTRA_OPTIONS = new Map([
+  ["--model", { takes: "value" }],
+  ["-m", { takes: "value" }],
+  ["-c", { takes: "value", check: checkCodexConfigValue }],
+  ["--config", { takes: "value", check: checkCodexConfigValue }],
+  ["--disable", { takes: "value", check: (v) => (/^[a-z0-9_.]+$/.test(v) ? "" : "not a feature name") }],
+  ["--color", { takes: "value", only: new Set(["always", "never", "auto"]) }],
+]);
+
+/** BRIDGE_CODEX_ARGS_JSON (exact) or BRIDGE_CODEX_ARGS (quoted), checked against the allowlist. */
+function codexExtraArgs() {
+  const json = process.env.BRIDGE_CODEX_ARGS_JSON;
+  const tokens = argsFromEnv({ json, text: process.env.BRIDGE_CODEX_ARGS, label: "BRIDGE_CODEX_ARGS_JSON" });
+  return checkExtraArgs(
+    tokens,
+    json !== undefined && json !== "" ? "BRIDGE_CODEX_ARGS_JSON" : "BRIDGE_CODEX_ARGS",
+    CODEX_EXTRA_OPTIONS,
+    "Codex ephemeral and read-only, with no user config and its tool features disabled",
+  );
+}
+
+// ── Codex features: everything off except a short no-tool allowlist ──────────
+// Codex has no single "no tools" switch: its shell, apps, plugins, browser and
+// computer use, image tools, hooks and the rest are each a feature. So before a run
+// the bridge reads `codex features list` (no prompt, nothing sent to a model) and
+// passes `--disable <name>` for EVERY feature it lists, enabled, off or removed,
+// except those below, which change how a request is sent and give the model nothing
+// it can call. "Off" too because the run uses --ignore-user-config, so a feature the
+// user's config turned off can come back on at its default; "removed" too because
+// it costs nothing (a parse-only `--help` check with all of them exits 0) and covers a
+// feature that is only marked removed.
+// The list is read again for EVERY run, never cached: Codex can be upgraded while
+// the bridge runs (a LaunchAgent keeps it up for weeks), and a cached list would
+// leave a new release's tool features on. It is one short process with no prompt.
+// Fail closed: if the list cannot be run or read, Codex is not run at all.
+const CODEX_NO_TOOL_FEATURES = new Set([
+  "api_key_model_discovery",
+  "auth_elicitation",
+  "content_item_kinds",
+  "enable_request_compression",
+  "system_proxy_fallback",
+  "unbounded_connection_retries",
+]);
+const CODEX_FEATURES_TIMEOUT_MS = 15_000;
+
+/** Parse `codex features list` into the names to disable. Throws when it cannot. */
+function codexDisablesFrom(listing) {
+  const rows = [];
+  for (const line of String(listing).split("\n")) {
+    if (!line.trim()) continue;
+    const m = /^([a-z0-9_.]+)\s+(.+?)\s+(true|false)\s*$/.exec(line.trim());
+    if (!m) throw new Error(`unexpected line in the feature list: "${line.trim().slice(0, 80)}"`);
+    rows.push({ name: m[1], stage: m[2], enabled: m[3] === "true" });
+  }
+  if (!rows.length) throw new Error("the feature list was empty");
+  return rows.filter((r) => !CODEX_NO_TOOL_FEATURES.has(r.name)).map((r) => r.name);
+}
+
+function codexDisables() {
+  return new Promise((resolve, reject) => {
+    const refuse = (why) => reject(new BridgeError(
+      `refusing to run Codex: could not read its feature list to turn its tools off (${why}). ` +
+        "The usual cause is a Codex that is missing from the bridge's PATH or older than the " +
+        "tested 0.162.1, which has `features list`, --ignore-user-config, --ignore-rules and " +
+        "--disable: install or upgrade Codex",
+      { code: "CODEX_REFUSED", safeToExpose: true },
+    ));
+    execFile("codex", ["features", "list"], {
+      env: childEnvironment(), cwd: os.tmpdir(), timeout: CODEX_FEATURES_TIMEOUT_MS, maxBuffer: 1024 * 1024,
+    }, (error, stdout) => {
+      if (error) return refuse(error.code === "ENOENT" ? "codex was not found" : `codex features list failed`);
+      try {
+        resolve(codexDisablesFrom(stdout));
+      } catch (e) {
+        refuse(e.message);
+      }
+    }).stdin?.end();
+  });
+}
+
+// ── Apple's on-device model ───────────────────────────────────────────────────
+// Its context window is small (Apple documents 4096 tokens), so a prompt that
+// will not fit is refused up front with the limit named, rather than left to fail
+// inside `fm`. BRIDGE_APPLE_CONTEXT_TOKENS changes the limit.
+const APPLE_CONTEXT_TOKENS = positiveInteger(process.env.BRIDGE_APPLE_CONTEXT_TOKENS, 4096);
+
+/** BRIDGE_CLAUDE_ARGS_JSON (exact) or BRIDGE_CLAUDE_ARGS (quoted), checked against the allowlist. */
+function claudeExtraArgs() {
+  const json = process.env.BRIDGE_CLAUDE_ARGS_JSON;
+  const tokens = argsFromEnv({ json, text: process.env.BRIDGE_CLAUDE_ARGS, label: "BRIDGE_CLAUDE_ARGS_JSON" });
+  return checkClaudeExtraArgs(tokens, json !== undefined && json !== "" ? "BRIDGE_CLAUDE_ARGS_JSON" : "BRIDGE_CLAUDE_ARGS");
+}
+
 // ── Backends ──────────────────────────────────────────────────────────────────
 // Each backend maps an OpenAI request → { cmd, args, stdin } and parses the CLI's
 // stdout back to { text, promptTokens, completionTokens }. Backends are finalised
@@ -248,36 +475,56 @@ const BACKENDS = {
   /**
    * Claude Code CLI in headless print mode, one-shot completion, JSON output.
    * Invocation (authoritative, see also docs/LOCAL_BRIDGE.md):
-   *   claude -p --output-format json [--model <m>] [--effort <e>] [--append-system-prompt <s>]
+   *   claude -p --output-format json --safe-mode --no-session-persistence --tools=
+   *     [--model=<m>] [--effort=<e>] [--append-system-prompt=<s>]
    * with the prompt piped on stdin (fine up to Claude Code's 10MB stdin cap).
    * --output-format json → { result, is_error, session_id, ... }. Errors go to stderr +
    * a non-zero exit, which the runner surfaces. No token counts are in the JSON, so the
    * bridge estimates them (~4 chars/token).
    */
   claude: {
-    build({ model, system, prompt }) {
-      // Minimal, subscription-friendly invocation. Deliberately NO --bare: it isolates
-      // the run and stops Claude Code from seeing the ~/.claude credentials that
-      // `claude` + `/login` set up ("Not logged in"). The child env also has the
-      // provider API keys stripped (see runBackend) so the CLI uses your subscription
-      // login, not an ANTHROPIC_API_KEY. Add hardening flags (e.g.
-      // --permission-mode dontAsk --max-turns 1) via BRIDGE_CLAUDE_ARGS if wanted.
-      const args = ["-p", "--output-format", "json"];
+    build({ model, system, prompt, webSearch }) {
+      // Subscription-friendly invocation. Deliberately NO --bare: it isolates the run
+      // and stops Claude Code from seeing the ~/.claude credentials that `claude` +
+      // `/login` set up ("Not logged in"). The child env also has the provider API
+      // keys stripped (see runBackend) so the CLI uses your subscription login, not an
+      // ANTHROPIC_API_KEY.
+      //
+      // Three options on EVERY run, whatever the request or the configuration (a
+      // prompt is whatever a caller sent: a meeting transcript, a scraped page):
+      //   --safe-mode               no CLAUDE.md, skills, plugins, hooks, MCP servers
+      //                             or custom agents from this machine's config;
+      //   --tools=                  no built-in tools at all, so nothing in a prompt
+      //                             can get Claude Code to run anything here. A web-
+      //                             search request gets the read-only web tools only;
+      //   --no-session-persistence  the prompt and answer are not saved as a session.
+      // `--tools` is variadic: as a separate token it would swallow every following
+      // argument that does not start with "-". The one-token `--flag=value` form never
+      // does, so it cannot take an argument meant for something else.
+      // BRIDGE_CLAUDE_ARGS cannot undo any of this: see checkClaudeExtraArgs.
+      const args = [
+        "-p", "--output-format", "json",
+        "--safe-mode", "--no-session-persistence",
+        webSearch ? "--tools=WebSearch,WebFetch" : "--tools=",
+      ];
       // The effort suffix drives Claude too: current Claude Code has a first-class
       // `--effort low|medium|high|xhigh|max` (default high) that works in -p mode,
-      // so "sonnet:xhigh" → `--model sonnet --effort xhigh`. Values outside Claude's
+      // so "sonnet:xhigh" → `--model=sonnet --effort=xhigh`. Values outside Claude's
       // vocabulary (none/minimal/ultra are Codex-side) are stripped and ignored so an
       // invalid flag value never reaches the CLI.
+      // The model and the system text come from the request, a caller's strings, so
+      // each is joined to its flag in ONE token: a value such as "--settings={...}" or
+      // "--resume" is then only ever that flag's value, to commander and to anything
+      // that reads argv token by token, never an option of its own. (The same rule
+      // BRIDGE_CLAUDE_ARGS is held to: see checkClaudeExtraArgs.)
       const { id: modelId, effort } = splitModelEffort(model);
-      if (modelId) args.push("--model", modelId);
-      if (effort && CLAUDE_EFFORTS.has(effort)) args.push("--effort", effort);
-      if (system) args.push("--append-system-prompt", system);
-      const extra = argsFromEnv({
-        json: process.env.BRIDGE_CLAUDE_ARGS_JSON,
-        text: process.env.BRIDGE_CLAUDE_ARGS,
-        label: "BRIDGE_CLAUDE_ARGS_JSON",
-      });
-      return { cmd: "claude", args: [...args, ...extra], stdin: prompt };
+      if (modelId) args.push(`--model=${modelId}`);
+      if (effort && CLAUDE_EFFORTS.has(effort)) args.push(`--effort=${effort}`);
+      if (system) args.push(`--append-system-prompt=${system}`);
+      // Opt-in web search ("web_search": true in the request): only the read-only web
+      // tools. One token, so the variadic flag cannot swallow anything after it.
+      if (webSearch) args.push("--allowedTools=WebSearch,WebFetch");
+      return { cmd: "claude", args: [...args, ...claudeExtraArgs()], stdin: prompt };
     },
     parse(out) {
       const j = JSON.parse(out);
@@ -299,20 +546,38 @@ const BACKENDS = {
    * piped prompt (same shape as the command backend) rather than dropped.
    */
   codex: {
-    build({ model, system, prompt }) {
+    build({ model, system, prompt, webSearch, codexDisable }) {
+      // Fail closed: without the feature list (see codexDisables) there is no way
+      // to turn Codex's tools off, so there is no run.
+      if (!Array.isArray(codexDisable)) {
+        throw new BridgeError("refusing to run Codex: its feature list was not read", { code: "CODEX_REFUSED", safeToExpose: true });
+      }
       // randomUUID, not Date.now(): two concurrent completions starting in the
       // same millisecond must not share (and cross-read/unlink) one result file.
       const outFile = path.join(os.tmpdir(), `codex-bridge-${process.pid}-${crypto.randomUUID()}.txt`);
-      const args = ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--output-last-message", outFile];
+      // On EVERY run:
+      //   --ephemeral             no session files are saved;
+      //   --sandbox read-only     nothing on disk can be changed;
+      //   --ignore-user-config    no ~/.codex/config.toml (its MCP servers, profiles,
+      //                           providers, base URL); the login still works;
+      //   --ignore-rules          no user or project execpolicy rules;
+      //   --disable <feature>     for every feature but the no-tool allowlist;
+      //   -c web_search="disabled" unless the request opted in to web search, which
+      //                           gets the top-level --search flag (before `exec`).
+      const args = [
+        ...(webSearch ? ["--search"] : []),
+        "exec", "--ephemeral", "--sandbox", "read-only", "--ignore-user-config", "--ignore-rules",
+        "--skip-git-repo-check", "--output-last-message", outFile,
+        ...(webSearch ? [] : ["-c", 'web_search="disabled"']),
+        ...codexDisable.flatMap((name) => ["--disable", name]),
+      ];
       const { id, effort } = splitModelEffort(model);
-      if (id) args.push("--model", id);
+      // Joined to its flag in one token, like Claude's: a caller's string is only
+      // ever the model's value.
+      if (id) args.push(`--model=${id}`);
       // -c parses its value as TOML, the inner double quotes are required.
       if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
-      const extra = argsFromEnv({
-        json: process.env.BRIDGE_CODEX_ARGS_JSON,
-        text: process.env.BRIDGE_CODEX_ARGS,
-        label: "BRIDGE_CODEX_ARGS_JSON",
-      });
+      const extra = codexExtraArgs();
       return {
         cmd: "codex",
         args: [...args, ...extra],
@@ -334,7 +599,28 @@ const BACKENDS = {
   },
 
   /**
-   * Universal escape hatch: BRIDGE_COMMAND is a quoted command template (see
+   * Apple's on-device model through the `fm` CLI (model `system`):
+   *   fm respond --no-stream [-i <system text>]
+   * with the prompt on stdin. The arguments are fixed: never --tool, --resume,
+   * --save-transcript, --image or --schema, and nothing from configuration. A system
+   * text that starts with "-" gets a leading space, so `fm` can only read it as the
+   * value of -i, never as an option of its own.
+   */
+  apple: {
+    build({ system, prompt }) {
+      const args = ["respond", "--no-stream"];
+      if (system) args.push("-i", system.startsWith("-") ? ` ${system}` : system);
+      return { cmd: "fm", args, stdin: prompt };
+    },
+    parse(out) {
+      return { text: out.trim() };
+    },
+  },
+
+  /**
+   * Universal escape hatch, and unchecked: the bridge cannot know what the command
+   * does, so none of the safety options above apply to it.
+   * BRIDGE_COMMAND is a quoted command template (see
    * lib/parse-argv.mjs for the exact grammar — quoting supported, NO shell
    * expansion) whose `{model}` tokens are substituted; the combined system+prompt
    * text is piped to stdin and the process's raw stdout is taken as the completion.
@@ -392,6 +678,19 @@ function foldMessages(messages = []) {
   return { system, prompt };
 }
 
+// For the on-device limit an undercount is the failure that matters (the prompt
+// then overflows inside fm), so ASCII counts at ~4 characters a token and every
+// other character (CJK, emoji, accented letters) as at least one token each.
+function appleTokenEstimate(str) {
+  let ascii = 0;
+  let other = 0;
+  for (const ch of str || "") {
+    if (ch.codePointAt(0) < 128) ascii++;
+    else other++;
+  }
+  return Math.ceil(ascii / 4) + other;
+}
+
 function estimateTokens(str) {
   return Math.max(1, Math.round((str || "").length / 4)); // rough ~4 chars/token fallback
 }
@@ -404,6 +703,7 @@ function estimateTokens(str) {
 function resolveBackendName(model) {
   if (BACKEND !== "auto") return BACKEND;
   const m = (model || "").toLowerCase();
+  if (m === "system") return "apple"; // Apple's on-device model, fm's own name for it
   if (/\b(opus|sonnet|haiku)\b|claude/.test(m)) return "claude";
   if (/gpt|codex|^o[0-9]/.test(m)) return "codex";
   return process.env.BRIDGE_AUTO_DEFAULT || "claude"; // ambiguous id → default family
@@ -442,17 +742,29 @@ function killChildGracefully(child) {
   child.once("close", () => clearTimeout(hardKill));
 }
 
-function runBackend({ model, system, prompt }, { signal } = {}) {
+async function runBackend({ model, system, prompt, webSearch = false }, { signal } = {}) {
   const backendName = resolveBackendName(model);
   const backend = BACKENDS[backendName];
-  if (!backend) throw new Error(`Unknown backend "${backendName}" (claude | codex | command | auto)`);
-  const { cmd, args, stdin, resultFile } = backend.build({ model: model || DEFAULT_MODEL, system, prompt });
+  if (!backend) throw new Error(`Unknown backend "${backendName}" (claude | codex | apple | command | auto)`);
+  if (backendName === "apple") {
+    const tokens = appleTokenEstimate(`${system || ""}${prompt || ""}`);
+    if (tokens > APPLE_CONTEXT_TOKENS) {
+      throw new BridgeError(
+        `The prompt is about ${tokens} tokens, more than the on-device model's ${APPLE_CONTEXT_TOKENS} tokens. ` +
+          "Send a shorter prompt or use another model.",
+        { code: "PROMPT_TOO_LONG", safeToExpose: true },
+      );
+    }
+  }
+  const codexDisable = backendName === "codex" ? await codexDisables() : undefined;
+  const { cmd, args, stdin, resultFile } = backend.build({ model: model || DEFAULT_MODEL, system, prompt, webSearch, codexDisable });
+  return spawnBackend({ backend, cmd, args, stdin, resultFile, system, prompt }, { signal });
+}
+
+function spawnBackend({ backend, cmd, args, stdin, resultFile, system, prompt }, { signal } = {}) {
 
   // Force the CLI onto its own login: strip provider API keys from the child env.
-  const childEnv = { ...process.env };
-  if (process.env.BRIDGE_KEEP_ENV_KEYS !== "1") {
-    for (const k of STRIP_ENV_KEYS) delete childEnv[k];
-  }
+  const childEnv = childEnvironment();
 
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -630,6 +942,46 @@ function openAiResponse({ model, text, promptTokens, completionTokens }) {
   };
 }
 
+// ── Event streams (`stream: true`) ──────────────────────────────────────────────
+// The CLIs answer in one piece, so a stream is: 200 + text/event-stream at once, SSE
+// comment heartbeats while the CLI runs, then the whole answer as OpenAI chunks: the
+// role, the text as ONE content delta, a stop chunk, a usage chunk when the caller
+// asked for one (stream_options.include_usage), and `data: [DONE]`. A failure after
+// the headers went out is one `data: {"error":{...}}` event, then the stream ends,
+// with no [DONE]. Heartbeats are SSE comments (":" lines, which every SSE parser
+// skips), never the bare newline of the JSON keepalive: in an event stream that is
+// an empty event.
+const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-store" };
+const SSE_COMMENT = ": keepalive\n\n";
+// The longest gap between stream heartbeats. Clients keep an event stream open on
+// bytes arriving: Node's fetch gives up after 300 s of silence, Cloudflare's edge
+// after about 100 s, and some clients far sooner.
+const SSE_HEARTBEAT_MAX_MS = 10_000;
+/** A stream's heartbeat interval: BRIDGE_KEEPALIVE_MS when that is shorter, otherwise SSE_HEARTBEAT_MAX_MS. Never off. */
+function sseHeartbeatMs(keepaliveMs) {
+  return keepaliveMs > 0 ? Math.min(keepaliveMs, SSE_HEARTBEAT_MAX_MS) : SSE_HEARTBEAT_MAX_MS;
+}
+
+/** The `data:` payloads of a finished completion, in order, ending with [DONE]. */
+function streamFrames({ model, text, usage }) {
+  const base = {
+    id: `chatcmpl-bridge-${process.hrtime.bigint().toString(36)}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: model || DEFAULT_MODEL || BACKEND,
+  };
+  // With include_usage, OpenAI puts `usage: null` on every chunk but the last.
+  const chunk = (choices) => JSON.stringify({ ...base, choices, ...(usage ? { usage: null } : {}) });
+  const frames = [
+    chunk([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]),
+    chunk([{ index: 0, delta: { content: text }, finish_reason: null }]),
+    chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+  ];
+  if (usage) frames.push(JSON.stringify({ ...base, choices: [], usage }));
+  frames.push("[DONE]");
+  return frames;
+}
+
 // ── HTTP server ─────────────────────────────────────────────────────────────────
 
 function send(res, status, body) {
@@ -715,14 +1067,12 @@ function discoveryAuthOk(req) {
 let activeCompletions = 0;
 
 // OpenAI request features the bridge does NOT implement. Rejecting them loudly beats
-// silently ignoring them, a caller that sets `stream: true` would otherwise wait for
-// SSE that never comes and misread the buffered JSON. An explicit `null` is treated
-// as absent throughout: several OpenAI SDKs serialize unset optionals as null.
+// silently ignoring them, a caller that sets `tools` would otherwise get an answer
+// that never called them. An explicit `null` is treated as absent throughout:
+// several OpenAI SDKs serialize unset optionals as null. (`stream` is supported:
+// see streamFrames.)
 const UNSUPPORTED_FIELDS = ["tools", "tool_choice", "response_format", "functions"];
 function unsupportedFeature(body) {
-  if (body.stream !== undefined && body.stream !== false && body.stream !== null) {
-    return "stream (the bridge returns a single buffered completion)";
-  }
   if (body.n != null && body.n !== 1) return "n > 1";
   for (const f of UNSUPPORTED_FIELDS) if (body[f] != null) return f;
   return null;
@@ -809,6 +1159,12 @@ function handleRequest(req, res) {
       if ((body.messages ?? []).some((m) => !ALLOWED_ROLES.has(m.role))) {
         return send(res, 400, { error: { message: `message role must be one of: ${[...ALLOWED_ROLES].join(", ")}` } });
       }
+      // A model id never starts with "-". One that does, or one that is not a string,
+      // is refused before any backend sees it: the codex and command backends pass the
+      // model as its own argv element, where it could read as an option.
+      if (body.model != null && (typeof body.model !== "string" || body.model.startsWith("-"))) {
+        return send(res, 400, { error: { message: 'model must be a string that does not start with "-"' } });
+      }
       const unsupported = unsupportedFeature(body);
       if (unsupported) {
         return send(res, 400, { error: { message: `Unsupported request feature: ${unsupported}` } });
@@ -840,18 +1196,26 @@ function handleRequest(req, res) {
       // Cloudflare, so the default ("auto") heartbeats per request: requests
       // carrying Cloudflare edge headers get the defence, direct/local requests
       // keep their real status codes (a 504 timeout stays a 504).
+      //
+      // An event stream (`stream: true`) always commits at once and heartbeats in
+      // its own framing, SSE comments, at least every SSE_HEARTBEAT_MAX_MS: the
+      // whitespace heartbeat never touches it (see streamFrames).
       const keepaliveMs = keepaliveMsFor(req);
-      if (KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
+      const stream = Boolean(body.stream);
+      if (!stream && KEEPALIVE_MS === 0 && isTunnelForwarded(req) && !warnedKeepaliveOffOnTunnel) {
         warnedKeepaliveOffOnTunnel = true;
         log.warn("tunnel-forwarded request with the keepalive disabled: responses slower than ~100s will die with a Cloudflare 524 (set BRIDGE_KEEPALIVE_MS=auto)");
       }
-      if (keepaliveMs > 0) {
+      let beat = null;
+      if (stream) {
+        res.writeHead(200, SSE_HEADERS);
+        res.write(SSE_COMMENT);
+        beat = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write(SSE_COMMENT); }, sseHeartbeatMs(keepaliveMs));
+      } else if (keepaliveMs > 0) {
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
         res.write("\n");
+        beat = setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, keepaliveMs);
       }
-      const beat = keepaliveMs > 0
-        ? setInterval(() => { if (!res.writableEnded && !res.destroyed) res.write("\n"); }, keepaliveMs)
-        : null;
       let settled = false;
       // A response 'close' before finish() means the CLIENT went away mid-flight
       // (it also fires after a normal end, hence the settled guard): abort the
@@ -870,24 +1234,35 @@ function handleRequest(req, res) {
         if (keepaliveMs > 0) return res.end(JSON.stringify(obj)); // headers already sent
         return send(res, status, obj);
       };
+      // A stream ends with its data events (see streamFrames), then the response ends.
+      const finishStream = (frames) => {
+        settled = true;
+        if (beat) clearInterval(beat);
+        if (res.writableEnded || res.destroyed) return;
+        res.end(frames.map((frame) => `data: ${frame}\n\n`).join(""));
+      };
 
       try {
+        const webSearch = body.web_search === true;
         const { text, promptTokens, completionTokens } = await runBackend(
-          { model: body.model, system, prompt },
+          { model: body.model, system, prompt, webSearch },
           { signal: ac.signal },
         );
         log.info(
-          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""} → ${text.length} chars in ${Date.now() - t0}ms`,
+          `${resolveBackendName(body.model)} ${body.model || DEFAULT_MODEL || ""}${webSearch ? " +web" : ""}${stream ? " stream" : ""} → ${text.length} chars in ${Date.now() - t0}ms`,
         );
-        return finish(
-          200,
-          openAiResponse({
-            model: body.model,
-            text,
-            promptTokens: promptTokens ?? estimateTokens(system + prompt),
-            completionTokens: completionTokens ?? estimateTokens(text),
-          }),
-        );
+        const response = openAiResponse({
+          model: body.model,
+          text,
+          promptTokens: promptTokens ?? estimateTokens(system + prompt),
+          completionTokens: completionTokens ?? estimateTokens(text),
+        });
+        if (stream) {
+          // The same estimate as a buffered completion, when the caller asks for it.
+          const usage = body.stream_options?.include_usage ? response.usage : null;
+          return finishStream(streamFrames({ model: body.model, text, usage }));
+        }
+        return finish(200, response);
       } catch (e) {
         if (e.code === "CLIENT_DISCONNECTED") {
           // The socket is gone, there is nobody to answer; just record it.
@@ -904,9 +1279,15 @@ function handleRequest(req, res) {
         const message = EXPOSE_ERROR_DETAILS || e.safeToExpose ? e.message : "The local model backend failed";
         // A timed-out backend is a gateway timeout; every other backend failure
         // (spawn, non-zero exit, parse) is a bad gateway. With the keepalive
-        // heartbeat active the status is already spent and this arrives in-body.
-        const status = e.code === "BACKEND_TIMEOUT" ? 504 : 502;
-        return finish(status, { error: { message, type: "bridge_backend_error", id: errorId } });
+        // heartbeat active the status is already spent and this arrives in-body;
+        // in a stream it is the one data event before the stream ends.
+        // A prompt too long for the model is the caller's to fix (400, with OpenAI's
+        // own code for it); a backend the bridge refuses to run is unavailable (503).
+        const status = { BACKEND_TIMEOUT: 504, PROMPT_TOO_LONG: 400, CODEX_REFUSED: 503 }[e.code] ?? 502;
+        const error = { error: { message, type: "bridge_backend_error", id: errorId } };
+        if (e.code === "PROMPT_TOO_LONG") error.error.code = "context_length_exceeded";
+        if (stream) return finishStream([JSON.stringify(error)]);
+        return finish(status, error);
       } finally {
         // Settlement-scoped release: runBackend settles only after its child
         // closed, so this can never let a new spawn overlap a dying child.
@@ -967,7 +1348,7 @@ function createBridgeServer() {
 
 // Pure pieces exported for unit tests; importing this module never starts a
 // server or registers signal handlers (see the is-main guard below).
-export { foldMessages, modelCaps, BACKENDS, splitModelEffort, unsupportedFeature, createBridgeServer, BridgeError };
+export { foldMessages, modelCaps, BACKENDS, splitModelEffort, codexDisablesFrom, checkExtraArgs, CODEX_EXTRA_OPTIONS, unsupportedFeature, createBridgeServer, BridgeError, sseHeartbeatMs };
 
 // realpath matters: npm installs bin entries as SYMLINKS (node_modules/.bin/…),
 // so argv[1] is the link while import.meta.url is the resolved file — without
@@ -981,7 +1362,26 @@ const IS_MAIN = (() => {
   }
 })();
 
-if (IS_MAIN) {
+// Configuration that would undo the safety options is refused at start, not on the
+// first request: only for backends that can run Claude Code, since the others never
+// read BRIDGE_CLAUDE_ARGS. exitCode rather than exit(): nothing has started, so the
+// process ends by itself once the message is flushed.
+const STARTUP_REFUSAL = (() => {
+  if (!IS_MAIN) return null;
+  try {
+    if (BACKEND === "claude" || BACKEND === "auto") claudeExtraArgs();
+    if (BACKEND === "codex" || BACKEND === "auto") codexExtraArgs();
+    return null;
+  } catch (e) {
+    return e.message;
+  }
+})();
+if (STARTUP_REFUSAL) {
+  log.error(`refusing to start: ${STARTUP_REFUSAL}`);
+  process.exitCode = 1;
+}
+
+if (IS_MAIN && !STARTUP_REFUSAL) {
   const server = createBridgeServer();
 
   // Friendly startup failures: EADDRINUSE is the most common first run collision
