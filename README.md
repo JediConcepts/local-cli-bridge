@@ -127,14 +127,13 @@ BRIDGE_BACKEND=auto BRIDGE_MODELS="sonnet,sonnet:xhigh,opus,haiku,gpt-5.6-sol,gp
 BRIDGE_BACKEND=command BRIDGE_COMMAND='ollama run {model}' npm run bridge
 
 # Claude + Codex + Apple's on-device Foundation Model (macOS 27) on one port
-BRIDGE_BACKEND=auto BRIDGE_AUTO_DEFAULT=command BRIDGE_COMMAND='fm respond --no-stream' \
-  BRIDGE_MODELS="sonnet,opus,haiku,gpt-5.5,system" npm run bridge
+BRIDGE_BACKEND=auto BRIDGE_MODELS="sonnet,opus,haiku,gpt-5.5,system" npm run bridge
 ```
 
-The last example needs no new code: Apple's `fm` CLI reads a prompt on stdin, so the
-generic `command` backend serves it, and request model `system` routes to it. See
-[Apple Foundation Models](./docs/LOCAL_BRIDGE.md#apple-foundation-models-macos-27) for the
-details and the one catch.
+Apple's model is built in: request model `system` runs `fm respond` with fixed, safe
+arguments, no `BRIDGE_COMMAND` needed. Its context window is small (about 4096 tokens), and
+a longer prompt gets a 400 naming the limit. See
+[Apple Foundation Models](./docs/LOCAL_BRIDGE.md#apple-foundation-models-macos-27).
 
 Config can live in a file instead of the shell: the bridge auto-loads `.env.bridge.local` /
 `.env.local` (only `BRIDGE_*` keys are read). Copy [`.env.example`](./.env.example) to get
@@ -206,8 +205,16 @@ JSON argv forms, cancellation semantics) is in
   A request's model and system text reach Claude Code only joined to their flags
   (`--model=…`), so nothing a request sends can stand in argv as an option, and a
   request `model` that starts with `-` is a 400.
+- Codex gets the same treatment: every run is `--ephemeral`, `--sandbox read-only`,
+  `--ignore-user-config` and `--ignore-rules`, with web search off unless asked for and a
+  `--disable` for every Codex feature except a short no-tool allowlist (the bridge reads
+  `codex features list` first, and refuses to run Codex if it cannot). `BRIDGE_CODEX_ARGS`
+  is an allowlist too. Apple's model (`system`) runs `fm respond --no-stream` with fixed
+  arguments: no tools, no saved transcript. The `command` backend is unchecked: the bridge
+  cannot know what your command does.
 - Provider API keys are stripped from the CLI's environment by default, and
-  `ANTHROPIC_BASE_URL` always is, so prompts go to Anthropic and nowhere else.
+  `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_EXEC_SERVER_URL` and
+  `CODEX_URL` always are, so prompts go to the CLI's own provider and nowhere else.
 - Request body, process output, concurrency, and per-request time are all capped; a
   disconnected client's CLI child is killed (best effort — see [SECURITY.md](./SECURITY.md)).
 - Raw backend errors are redacted from clients by default, with a correlation id linking

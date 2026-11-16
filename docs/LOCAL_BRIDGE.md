@@ -55,28 +55,33 @@ single custom endpoint in your application and pick the model per request. Set
 
 ### Apple Foundation Models (macOS 27)
 
-macOS 27 ships Apple's on-device Foundation Model with an `fm` CLI at `/usr/bin/fm`.
-`fm respond` reads a prompt on stdin and prints the answer, so the `command` backend serves
-it with config alone. To add it to an `auto` bridge alongside Claude and Codex:
+macOS 27 ships Apple's on-device Foundation Model with an `fm` CLI at `/usr/bin/fm`. The
+bridge has it built in: model `system` runs `fm respond` with fixed, safe arguments (see
+[How the backends invoke the CLIs](#how-the-backends-invoke-the-clis)). No
+`BRIDGE_COMMAND` is needed. In an `auto` bridge, add it to the advertised list:
 
 ```bash
 BRIDGE_BACKEND=auto
-BRIDGE_AUTO_DEFAULT=command
-BRIDGE_COMMAND='fm respond --no-stream'
 BRIDGE_MODELS=sonnet,opus,haiku,gpt-5.5,system   # your existing list, plus "system"
 ```
 
-Requests for model `system` then go to the on-device model, and Claude and Codex ids route
-as before. The bridge's API key check and the Cloudflare Tunnel path apply to it like any
-other backend, so a remote application can reach it. Check `fm available` reports the
-model as available, and read Apple's terms with `fm license` before exposing it remotely.
+Or serve it alone with `BRIDGE_BACKEND=apple`. Requests for model `system` then go to the
+on-device model, and Claude and Codex ids route as before. The bridge's API key check and
+the Cloudflare Tunnel path apply to it like any other backend. Check `fm available` reports
+the model as available, and read Apple's terms with `fm license` before exposing it
+remotely.
+
+An older setup (`BRIDGE_AUTO_DEFAULT=command` with `BRIDGE_COMMAND='fm respond --no-stream'`)
+still starts, but model `system` now goes to the built-in backend. Remove both lines, so
+that a mistyped model id reaches Claude and gets an error rather than an answer from `fm`.
 
 Things to know:
 
-- **A mistyped model id now goes to `fm`.** `BRIDGE_AUTO_DEFAULT` catches every id that is
-  not recognisably Claude (`opus`/`sonnet`/`haiku`/`claude`) or Codex (`gpt`/`codex`/`o1`
-  and so on). With the default (`claude`), a typo reaches Claude; with `command`, it
-  reaches Apple's model and returns an answer instead of an error.
+- **`BRIDGE_AUTO_DEFAULT` catches every other id.** An id that is not `system` and not
+  recognisably Claude (`opus`/`sonnet`/`haiku`/`claude`) or Codex (`gpt`/`codex`/`o1` and
+  so on) goes to it. With the default (`claude`), a typo reaches Claude.
+- **Long prompts are refused.** About 4096 tokens fit; a longer one gets a 400 naming the
+  limit. Send transcripts and other long work to Claude or Codex.
 - **Prompts stay on the Mac.** The model runs on the device and `--no-stream` saves no
   transcript. The bridge logs only the model id, response size and timing for a successful
   request. A failed request logs the error, which can include the CLI's stderr.
@@ -94,7 +99,7 @@ Things to know:
 |---|---|---|
 | `PORT` | `8787` | listen port |
 | `HOST` | `127.0.0.1` | bind address, keep it loopback unless you must expose it |
-| `BRIDGE_BACKEND` | `claude` | `claude` \| `codex` \| `command` \| `auto` (dispatch by model id) |
+| `BRIDGE_BACKEND` | `claude` | `claude` \| `codex` \| `apple` \| `command` \| `auto` (dispatch by model id; model `system` goes to `apple`) |
 | `BRIDGE_AUTO_DEFAULT` | `claude` | `auto` mode: backend for an ambiguous model id |
 | `BRIDGE_COMMAND` |, | `command` backend: a quoted command template; `{model}` tokens are substituted, prompt piped to stdin. Quoting and backslash escapes are supported (a **limited argv parser** — no shell expansion, no substitution; see `scripts/lib/parse-argv.mjs` for the exact grammar) |
 | `BRIDGE_COMMAND_JSON` |, | `command` backend, exact form: a JSON array of strings (`'["ollama","run","{model}"]'`). Wins over `BRIDGE_COMMAND` when both are set |
@@ -112,7 +117,8 @@ Things to know:
 | `BRIDGE_EXPOSE_ERROR_DETAILS` | `0` | `1` returns raw backend error messages to the client (they can reveal executable names, paths, and login state), set it only on a trusted local deployment; the default returns a generic message + correlation id, with full detail in the server log |
 | `BRIDGE_ALLOW_QUERY_KEY` | `0` | `1` enables `GET /v1/models?key=<BRIDGE_API_KEY>` for browser viewing through the tunnel (key lands in history/logs, opt-in) |
 | `BRIDGE_TRUST_CF_ACCESS` | `0` | `1` lets requests that passed Cloudflare Access (edge-stamped `Cf-Access-Jwt-Assertion`) view GET discovery routes. Only sound while Access covers the hostname |
-| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND`. Quotes group **and are stripped** (shell-style): a flag whose value must contain literal quotes — a Codex TOML override, say — needs them nested, `-c 'model_reasoning_effort="high"'`, or the `*_ARGS_JSON` form. `BRIDGE_CLAUDE_ARGS` is an allowlist: see [How the backends invoke the CLIs](#how-the-backends-invoke-the-clis) |
+| `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND`. Quotes group **and are stripped** (shell-style): a flag whose value must contain literal quotes — a Codex TOML override, say — needs them nested, `-c 'model_reasoning_effort="high"'`, or the `*_ARGS_JSON` form. Both are allowlists, checked at start: see [How the backends invoke the CLIs](#how-the-backends-invoke-the-clis) |
+| `BRIDGE_APPLE_CONTEXT_TOKENS` | `4096` | the most tokens (estimated) a prompt and system text for model `system` may have; a longer one gets a 400 naming the limit |
 | `BRIDGE_CLAUDE_ARGS_JSON` / `BRIDGE_CODEX_ARGS_JSON` |, | exact form: a JSON array of strings, wins over the plain variable when both are set |
 | `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them). `ANTHROPIC_BASE_URL` is removed either way |
 | `BRIDGE_ENV_FILE` |, | explicit env-file path, overriding the auto-load order below |
@@ -237,14 +243,73 @@ This section is authoritative for what the bridge actually runs:
   variable and the flag. The old advice to add hardening here (`--permission-mode
   dontAsk --max-turns 1`) still works but is no longer needed: there are no tools to
   permit.
-- **`codex`**, `codex exec --ephemeral --sandbox read-only --skip-git-repo-check
-  --output-last-message <tmp>`, prompt on stdin. Codex writes only its final message to
-  `<tmp>`, which the bridge reads, so agent chatter on stdout never pollutes the answer,
-  and `read-only` blocks filesystem writes. `--skip-git-repo-check` is required because
-  the bridge runs every CLI from a neutral temp directory (not a git repo) — keep it if
-  you reproduce the command by hand from somewhere else. `codex exec` has no
-  system-prompt flag, so system/developer text is **prepended to the piped prompt**
-  rather than dropped.
+- **`codex`**, prompt on stdin, as
+
+  ```
+  codex [--search] exec --ephemeral --sandbox read-only --ignore-user-config --ignore-rules
+    --skip-git-repo-check --output-last-message <tmp> [-c web_search="disabled"]
+    --disable <feature> ... [--model=<m>] [-c model_reasoning_effort="<e>"] [BRIDGE_CODEX_ARGS]
+  ```
+
+  Codex writes only its final message to `<tmp>`, which the bridge reads, so agent
+  chatter on stdout never pollutes the answer. `--skip-git-repo-check` is required
+  because the bridge runs every CLI from a neutral temp directory (not a git repo).
+  `codex exec` has no system-prompt flag, so system/developer text is **prepended to the
+  piped prompt** rather than dropped.
+
+  A prompt can be an untrusted transcript, so every run is made as safe as Claude's:
+
+  | Option | What it does |
+  | --- | --- |
+  | `--ephemeral` | no session files are saved |
+  | `--sandbox read-only` | nothing on disk can be changed |
+  | `--ignore-user-config` | `~/.codex/config.toml` is not loaded: no MCP servers, profiles, providers or base URL from it. The login still works. |
+  | `--ignore-rules` | no user or project execpolicy rules |
+  | `--disable <feature>` | one for every feature Codex lists, except a short allowlist (below) |
+  | `-c web_search="disabled"` | web search is off, unless the request sends `"web_search": true`, which gets `--search` and nothing else |
+
+  **Codex has no single "no tools" switch.** Its shell, apps, plugins, browser and
+  computer use, image tools, hooks, skills and the rest are each a *feature*. Before the
+  first Codex run the bridge runs `codex features list` (no prompt, nothing sent to a
+  model) and passes `--disable` for every feature it lists, on or off, except those marked
+  `removed` and these, which change how a request is sent and give the model nothing it
+  can call: `api_key_model_discovery`, `auth_elicitation`, `content_item_kinds`,
+  `enable_request_compression`, `system_proxy_fallback`, `unbounded_connection_retries`.
+  Features that are off are disabled too, because `--ignore-user-config` brings each one
+  back to its default. A new Codex release that adds a tool feature is disabled by the same
+  rule, without a bridge update. The list is read once and reused; **if it cannot be run
+  or read, the bridge refuses to run Codex** (a 503 that says why) and tries again on the
+  next request.
+
+  Because `config.toml` is no longer read, its `model` and `model_reasoning_effort` no
+  longer apply: send the model in the request (or set `BRIDGE_MODEL`) and use an effort
+  suffix such as `gpt-5.5:high`.
+
+  `BRIDGE_CODEX_ARGS` / `BRIDGE_CODEX_ARGS_JSON` are an **allowlist**, checked when a
+  `codex` or `auto` bridge starts: `--model`/`-m`, `--disable <feature>`,
+  `--color always|never|auto`, and `-c`/`--config` for `model_reasoning_effort`,
+  `model_reasoning_summary` or `model_verbosity` with a plain word as the value. Anything
+  else (`--enable`, `--sandbox`, `-s`, `--full-auto`, `--dangerously-*`, `--add-dir`,
+  `--cd`, `--profile`, `--oss`, any other `-c`, a bare argument such as `resume`) refuses
+  to start the bridge, naming the flag.
+
+  `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_EXEC_SERVER_URL` and `CODEX_URL` are removed
+  from every child's environment, like `ANTHROPIC_BASE_URL`, even with
+  `BRIDGE_KEEP_ENV_KEYS=1`: each can send Codex's requests to another server.
+
+- **`apple`** (model `system`), Apple's on-device model, as
+  `fm respond --no-stream [-i <system text>]`, prompt on stdin. The arguments are fixed:
+  never `--tool`, `--resume`, `--save-transcript`, `--image` or `--schema`, and nothing
+  from configuration. A system text that starts with `-` gets a leading space, so `fm`
+  only ever reads it as the value of `-i`. A web-search request gets no tool here either.
+  The model's context window is small (4096 tokens), so a prompt the bridge estimates
+  (about 4 characters a token) as larger is refused with a 400, code
+  `context_length_exceeded`, naming the limit, before `fm` runs.
+  `BRIDGE_APPLE_CONTEXT_TOKENS` changes the limit.
+
+- **`command`** is **unchecked**: the bridge cannot know what `BRIDGE_COMMAND` does, so
+  none of the options above apply. Only point it at a program you trust with whatever a
+  caller sends.
 
 ### Cancellation
 

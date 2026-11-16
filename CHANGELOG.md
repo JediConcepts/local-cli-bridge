@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+### Upgrading from 0.3.0
+
+Suggested version: **0.4.0**. The HTTP API is a superset of 0.3.0's (streaming is new,
+nothing a 0.3.0 client sends is now read differently), but some configurations stop the
+bridge at start and Codex no longer reads `~/.codex/config.toml`. Under semver a 0.x minor
+is where breaking changes go, and the project still calls itself a development and testing
+bridge, so 1.0.0 would promise a stability it has not claimed yet.
+
+Every change a current user could notice, marked **breaking** (you may need to act) or
+**improvement** (nothing to do):
+
+| Change | Kind | Who it affects | What to do |
+| --- | --- | --- | --- |
+| `BRIDGE_CLAUDE_ARGS` / `_JSON` are an allowlist; anything else (`--add-dir`, `--mcp-config`, `--allowedTools`, `--resume`, ...) stops a `claude` or `auto` bridge at start | breaking | anyone whose extra Claude arguments used a flag not on the list | remove the flag; the message names it |
+| `BRIDGE_CODEX_ARGS` / `_JSON` are an allowlist (`--model`/`-m`, `--disable`, `--color`, `-c` for three output settings); `--enable`, `--sandbox`, `--dangerously-*`, `--add-dir`, `--profile`, `--oss`, other `-c` and bare arguments stop a `codex` or `auto` bridge at start | breaking | anyone with such Codex extras | remove the flag; the message names it |
+| Codex runs with `--ignore-user-config`: `config.toml`'s model, effort, profiles, MCP servers and providers no longer apply | breaking | Codex users who relied on `config.toml` for the model or effort | send the model in the request or set `BRIDGE_MODEL`; use an effort suffix such as `gpt-5.5:high` |
+| Codex runs with `--ignore-rules`, web search off unless asked for, and every tool feature disabled, so it cannot run commands, read files, browse or use apps | breaking for a workflow that let Codex use tools; an improvement for everyone else | anyone who expected Codex to act on the machine | none for chat use; a tool-using agent was never what the bridge offered |
+| Codex is refused (503, saying why) when `codex features list` cannot be run or read | breaking where `codex` is missing from the service PATH (it would have failed anyway) | `codex` and `auto` bridges | make `codex features list` work as the bridge's user |
+| Claude Code runs with `--safe-mode`, `--tools=` and `--no-session-persistence`: no CLAUDE.md, skills, plugins, hooks, MCP servers or tools, and no saved session | breaking for a setup that relied on those; an improvement for everyone else | Claude users whose prompts leaned on their CLAUDE.md or tools | put standing instructions in the system message |
+| `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_EXEC_SERVER_URL` and `CODEX_URL` never reach a child, even with `BRIDGE_KEEP_ENV_KEYS=1` | breaking for anyone routing a CLI through a gateway with these | gateway or proxy setups | none supported; the bridge talks to each CLI's own provider |
+| A request `model` that starts with `-` (or is not a string) is a 400 | improvement (breaking only for a client sending such an id) | none known | send a real model id |
+| The request's model and system text are joined to their flags (`--model=...`) | improvement | anyone reading the argv in logs or wrappers | none |
+| `"stream": true` gets an event stream instead of a 400 | improvement | streaming clients, which can now use the bridge | none |
+| Model `system` runs Apple's model through a built-in backend (`apple`), with fixed arguments; `BRIDGE_BACKEND=apple` works | improvement | macOS 27 users | drop any `BRIDGE_AUTO_DEFAULT=command` / `BRIDGE_COMMAND=fm ...` lines |
+| In `auto` mode, model `system` always goes to `apple`, even with `BRIDGE_AUTO_DEFAULT=command` | breaking for a `command` backend that served a model called `system` with something other than `fm` | very few | rename that model |
+| A prompt too long for model `system` is a 400 with code `context_length_exceeded`, naming the limit (`BRIDGE_APPLE_CONTEXT_TOKENS`, default 4096) | improvement | Apple model users | send long prompts elsewhere |
+| A missing env file logs a warning naming the paths tried | improvement | everyone | none |
+| `web_search: true` opts a request in to web search | improvement | anyone who wants it | none |
+
+The `command` backend is unchanged and unchecked.
+
+**Checked against 0.3.0's own tests.** The published package has no tests, so 0.3.0's
+test files were taken from `b3bb079` (also version 0.3.0; its scripts differ from the
+published ones only in the env-file warning) and run against this code: 89 of 99 pass.
+The 10 that fail each pin an old behaviour on purpose: two expect the old Claude argv
+(separate `--model sonnet` tokens, no safety options), two pass `--add-dir` or `--exact`
+through `BRIDGE_CLAUDE_ARGS` (now refused), four build a Codex run without the feature
+list (now refused) and with `--model` as a separate token, and two expect
+`"stream": true` to be a 400.
+
+### Security (Codex and Apple's model)
+
+- **Codex runs with no tools, nothing saved and no user settings.** Every `codex exec`
+  gets `--ephemeral`, `--sandbox read-only`, `--ignore-user-config` and `--ignore-rules`,
+  `-c web_search="disabled"` unless the request opted in to web search (then the top-level
+  `--search`, nothing else), and `--disable` for every feature `codex features list` shows
+  except removed ones and six that give the model nothing to call. Codex has no single
+  switch for "no tools", and disabling by rule means a tool feature added by a later
+  Codex release is off too. The list is read once with no prompt; if it cannot be read,
+  Codex is refused. The request's model is joined to `--model=`.
+- **`BRIDGE_CODEX_ARGS` and `BRIDGE_CODEX_ARGS_JSON` are an allowlist**, checked when a
+  `codex` or `auto` bridge starts.
+- **Codex's endpoint is fixed.** `OPENAI_BASE_URL`, `OPENAI_API_BASE`,
+  `CODEX_EXEC_SERVER_URL` and `CODEX_URL` are removed from every child's environment,
+  like `ANTHROPIC_BASE_URL`.
+- **Apple's on-device model is a built-in backend.** Model `system` (or
+  `BRIDGE_BACKEND=apple`) runs `fm respond --no-stream`, prompt on stdin, system text as
+  `-i`, and never `--tool`, `--resume`, `--save-transcript`, `--image` or `--schema`. It
+  needs no `BRIDGE_COMMAND`, works in `auto` mode and streams like every backend. A prompt
+  estimated above `BRIDGE_APPLE_CONTEXT_TOKENS` (default 4096) is a 400 with code
+  `context_length_exceeded` that names the limit.
+- The `command` backend is documented as unchecked.
+
 ### Added
 
 - **Streaming (`stream: true`).** A truthy `stream` used to be a 400; it now gets an
@@ -19,12 +82,6 @@
 - An opt-in end-to-end test (`tests/meetingbox.test.mjs`) that runs meetingbox's
   minutes writer, a real streaming client built on ai-execution-router, against the
   bridge. It is skipped unless `MEETINGBOX_MINUTES_DIR` points at an installed copy.
-
-- **Apple Foundation Models setup (docs only, no code change).** macOS 27's `fm` CLI reads
-  a prompt on stdin, so the existing `command` backend serves Apple's on-device model. A
-  new section in `docs/LOCAL_BRIDGE.md` and a README example show how to serve it as model
-  `system` from an `auto` bridge next to Claude and Codex, including the catch that
-  `BRIDGE_AUTO_DEFAULT=command` sends mistyped model ids to `fm` instead of Claude.
 
 - **`docs/RUNNING_AS_A_SERVICE.md`.** Running the bridge under launchd, `systemd --user`,
   and Windows Task Scheduler. The foreground quick start is fine for a trial, but the
