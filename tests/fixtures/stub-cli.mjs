@@ -73,7 +73,10 @@ if (name === "codex" && argv[0] === "features" && argv[1] === "list") {
     await flushWrite(process.stderr, "Error: could not load features\n");
     process.exit(1);
   }
-  const table = process.env.STUB_FEATURES ?? [
+  // STUB_FEATURES_FILE, when set, is read on every call, so a test can change the
+  // table between two requests (a Codex upgrade while the bridge runs).
+  const fromFile = process.env.STUB_FEATURES_FILE ? fs.readFileSync(process.env.STUB_FEATURES_FILE, "utf8") : undefined;
+  const table = fromFile ?? process.env.STUB_FEATURES ?? [
     "shell_tool                               stable             true",
     "unified_exec                             stable             true",
     "apps                                     stable             true",

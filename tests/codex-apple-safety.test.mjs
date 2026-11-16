@@ -15,6 +15,10 @@
 //   - streaming works for both.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { startBridge, startBridgeExpectingExit, makeStubBin } from "./helpers.mjs";
 
 const KEY = "test-key-123";
@@ -33,10 +37,11 @@ function disabled(argv) {
 }
 
 // The stub's default feature table (tests/fixtures/stub-cli.mjs) holds seven
-// tool features that are on, one that is off, one removed, and two on the
-// bridge's allowlist.
+// tool features that are on, one that is off, one removed (disabled too), and
+// two on the bridge's allowlist.
 const EXPECTED_DISABLED = [
-  "apps", "chronicle", "computer_use", "hooks", "image_generation", "plugins", "shell_tool", "unified_exec",
+  "apps", "chronicle", "collaboration_modes", "computer_use", "hooks", "image_generation", "plugins", "shell_tool",
+  "unified_exec",
 ].sort();
 
 // ── Codex: no tools, nothing saved, no user settings ───────────────────────────
@@ -71,16 +76,25 @@ test("a codex run is ephemeral, read-only, ignores user config and rules, and di
   }
 });
 
-test("the feature list is read once and reused for later runs", async () => {
+test("the feature list is read again for every run, so a Codex upgrade's new features are disabled", async () => {
   const stub = makeStubBin();
-  const bridge = await startBridge({ BRIDGE_BACKEND: "codex", BRIDGE_API_KEY: KEY, ...stub.env });
+  const file = path.join(stub.recordDir, "..", `features-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(file, "shell_tool                               stable             true\n");
+  const bridge = await startBridge({ BRIDGE_BACKEND: "codex", BRIDGE_API_KEY: KEY, ...stub.env, STUB_FEATURES_FILE: file });
   try {
-    for (let i = 0; i < 2; i++) assert.equal((await complete(bridge.base, { model: "gpt-5.5", messages: MESSAGES })).status, 200);
-    assert.equal(stub.records("codex").length, 2);
-    assert.equal(stub.records("codexfeatures").length, 1);
-    for (const run of stub.records("codex")) assert.deepEqual(disabled(run.argv), EXPECTED_DISABLED);
+    assert.equal((await complete(bridge.base, { model: "gpt-5.5", messages: MESSAGES })).status, 200);
+    fs.writeFileSync(file, [
+      "shell_tool                               stable             true",
+      "new_tool_from_an_upgrade                 stable             true",
+    ].join("\n"));
+    assert.equal((await complete(bridge.base, { model: "gpt-5.5", messages: MESSAGES })).status, 200);
+    const runs = stub.records("codex");
+    assert.equal(runs.length, 2);
+    assert.equal(stub.records("codexfeatures").length, 2, "the list was read for each run");
+    assert.ok(runs.some((r) => disabled(r.argv).includes("new_tool_from_an_upgrade")), "the new feature is disabled");
   } finally {
     bridge.stop();
+    fs.rmSync(file, { force: true });
   }
 });
 
@@ -114,6 +128,7 @@ for (const [label, env] of [
       const { error } = await res.json();
       assert.match(error.message, /refusing to run Codex/);
       assert.match(error.message, /feature list/);
+      assert.match(error.message, /0\.162\.1/, "names the likely cause: a missing or older Codex");
       assert.equal(stub.records("codex").length, 0, "codex never ran with a prompt");
     } finally {
       bridge.stop();
@@ -337,5 +352,59 @@ test("a streamed codex request whose feature list fails ends with an error frame
     assert.equal(stub.records("codex").length, 0);
   } finally {
     bridge.stop();
+  }
+});
+
+// ── CA overrides: a proxy must not be able to read prompts ─────────────────────
+
+const CA_OVERRIDES = [
+  "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+  "CURL_CA_BUNDLE", "NIX_SSL_CERT_FILE", "NODE_TLS_REJECT_UNAUTHORIZED",
+];
+
+test("CA and TLS-verification overrides never reach codex, claude or fm, even with BRIDGE_KEEP_ENV_KEYS=1", async () => {
+  const stub = makeStubBin();
+  const planted = Object.fromEntries(CA_OVERRIDES.map((k) => [k, k === "NODE_TLS_REJECT_UNAUTHORIZED" ? "0" : "/tmp/rogue-ca.pem"]));
+  const bridge = await startBridge({ BRIDGE_BACKEND: "auto", BRIDGE_API_KEY: KEY, ...stub.env, ...planted, BRIDGE_KEEP_ENV_KEYS: "1" });
+  try {
+    for (const model of ["gpt-5.5", "sonnet", "system"]) {
+      assert.equal((await complete(bridge.base, { model, messages: MESSAGES })).status, 200, model);
+    }
+    const records = ["codex", "codexfeatures", "claude", "fm"].flatMap((n) => stub.records(n));
+    assert.equal(records.length, 4);
+    for (const record of records) {
+      for (const k of CA_OVERRIDES) assert.ok(!record.envKeys.includes(k), `${k} removed from ${record.name}`);
+    }
+  } finally {
+    bridge.stop();
+  }
+});
+
+// ── Apple: a non-ASCII prompt is not undercounted ──────────────────────────────
+
+test("a CJK prompt over the on-device limit is refused: each non-ASCII character counts as a token", async () => {
+  const stub = makeStubBin();
+  const bridge = await startBridge({ BRIDGE_BACKEND: "auto", BRIDGE_API_KEY: KEY, ...stub.env, BRIDGE_APPLE_CONTEXT_TOKENS: "100" });
+  try {
+    // 200 characters: 50 tokens at 4 a token, but at least 200 as CJK.
+    const res = await complete(bridge.base, { model: "system", messages: [{ role: "user", content: "会".repeat(200) }] });
+    assert.equal(res.status, 400);
+    assert.equal(stub.records("fm").length, 0);
+  } finally {
+    bridge.stop();
+  }
+});
+
+// ── The stub folders are cleaned up ────────────────────────────────────────────
+
+test("makeStubBin removes its temp folders when the process exits", () => {
+  const helpers = new URL("./helpers.mjs", import.meta.url).href;
+  const script = `const { makeStubBin } = await import(${JSON.stringify(helpers)}); const s = makeStubBin(); console.log(JSON.stringify([s.dir, s.recordDir]));`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const dirs = JSON.parse(r.stdout.trim().split("\n").pop());
+  for (const d of dirs) {
+    assert.ok(d.startsWith(os.tmpdir()));
+    assert.ok(!fs.existsSync(d), `${d} was removed`);
   }
 });

@@ -339,7 +339,7 @@ test("codex build: every listed feature becomes a --disable pair", () => {
   assert.deepEqual(args.slice(i, i + 4), ["--disable", "shell_tool", "--disable", "apps"]);
 });
 
-test("codexDisablesFrom: disables all but removed and allowlisted features, enabled or not", () => {
+test("codexDisablesFrom: disables every feature but the allowlisted ones, enabled, off or removed", () => {
   const listing = [
     "shell_tool                               stable             true",
     "chronicle                                under development  false",
@@ -347,7 +347,7 @@ test("codexDisablesFrom: disables all but removed and allowlisted features, enab
     "guardianv2.thread_context                under development  true",
     "enable_request_compression               stable             true",
   ].join("\n");
-  assert.deepEqual(codexDisablesFrom(listing), ["shell_tool", "chronicle", "guardianv2.thread_context"]);
+  assert.deepEqual(codexDisablesFrom(listing), ["shell_tool", "chronicle", "collaboration_modes", "guardianv2.thread_context"]);
 });
 
 test("codexDisablesFrom: an empty or unexpected listing throws rather than disabling nothing", () => {

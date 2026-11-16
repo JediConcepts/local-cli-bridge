@@ -120,7 +120,7 @@ Things to know:
 | `BRIDGE_CLAUDE_ARGS` / `BRIDGE_CODEX_ARGS` |, | extra CLI flags appended to the preset. Quoted values are supported (`--append-system-prompt "be very concise"`), same limited argv grammar as `BRIDGE_COMMAND`. Quotes group **and are stripped** (shell-style): a flag whose value must contain literal quotes — a Codex TOML override, say — needs them nested, `-c 'model_reasoning_effort="high"'`, or the `*_ARGS_JSON` form. Both are allowlists, checked at start: see [How the backends invoke the CLIs](#how-the-backends-invoke-the-clis) |
 | `BRIDGE_APPLE_CONTEXT_TOKENS` | `4096` | the most tokens (estimated) a prompt and system text for model `system` may have; a longer one gets a 400 naming the limit |
 | `BRIDGE_CLAUDE_ARGS_JSON` / `BRIDGE_CODEX_ARGS_JSON` |, | exact form: a JSON array of strings, wins over the plain variable when both are set |
-| `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them). `ANTHROPIC_BASE_URL` is removed either way |
+| `BRIDGE_KEEP_ENV_KEYS` |, | set `1` to keep provider API keys in the child env (default strips them). Removed either way, from every child: `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_EXEC_SERVER_URL`, `CODEX_URL`, `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NIX_SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` |
 | `BRIDGE_ENV_FILE` |, | explicit env-file path, overriding the auto-load order below |
 | `BRIDGE_MODEL_CAPS` |, | per-model capability overrides: `"gpt-5.5=1000000:128000,opus=200000:32000"` (`<id>=<context>:<maxOutput>`). Overrides win over the family defaults and are reported with `caps_source: "override"` |
 
@@ -271,15 +271,17 @@ This section is authoritative for what the bridge actually runs:
   **Codex has no single "no tools" switch.** Its shell, apps, plugins, browser and
   computer use, image tools, hooks, skills and the rest are each a *feature*. Before the
   first Codex run the bridge runs `codex features list` (no prompt, nothing sent to a
-  model) and passes `--disable` for every feature it lists, on or off, except those marked
-  `removed` and these, which change how a request is sent and give the model nothing it
+  model) and passes `--disable` for every feature it lists, on, off or marked `removed`,
+  except these, which change how a request is sent and give the model nothing it
   can call: `api_key_model_discovery`, `auth_elicitation`, `content_item_kinds`,
   `enable_request_compression`, `system_proxy_fallback`, `unbounded_connection_retries`.
   Features that are off are disabled too, because `--ignore-user-config` brings each one
   back to its default. A new Codex release that adds a tool feature is disabled by the same
-  rule, without a bridge update. The list is read once and reused; **if it cannot be run
-  or read, the bridge refuses to run Codex** (a 503 that says why) and tries again on the
-  next request.
+  rule, without a bridge update. The list is read again before **every** run, so a Codex
+  upgraded while the bridge runs is covered at once. **If it cannot be run or read, the
+  bridge refuses to run Codex** (a 503 that says why). Codex 0.162.1 is the version
+  tested; an older one without `features list`, `--ignore-user-config`, `--ignore-rules`
+  or `--disable` gets that 503 or a 502, so upgrade Codex.
 
   Because `config.toml` is no longer read, its `model` and `model_reasoning_effort` no
   longer apply: send the model in the request (or set `BRIDGE_MODEL`) and use an effort
@@ -295,7 +297,9 @@ This section is authoritative for what the bridge actually runs:
 
   `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_EXEC_SERVER_URL` and `CODEX_URL` are removed
   from every child's environment, like `ANTHROPIC_BASE_URL`, even with
-  `BRIDGE_KEEP_ENV_KEYS=1`: each can send Codex's requests to another server.
+  `BRIDGE_KEEP_ENV_KEYS=1`: each can send Codex's requests to another server. So are the
+  certificate-authority overrides (see `BRIDGE_KEEP_ENV_KEYS` above), which would let a
+  proxy read prompts.
 
 - **`apple`** (model `system`), Apple's on-device model, as
   `fm respond --no-stream [-i <system text>]`, prompt on stdin. The arguments are fixed:
@@ -303,7 +307,8 @@ This section is authoritative for what the bridge actually runs:
   from configuration. A system text that starts with `-` gets a leading space, so `fm`
   only ever reads it as the value of `-i`. A web-search request gets no tool here either.
   The model's context window is small (4096 tokens), so a prompt the bridge estimates
-  (about 4 characters a token) as larger is refused with a 400, code
+  (about 4 ASCII characters a token, and every other character as a token of its own) as
+  larger is refused with a 400, code
   `context_length_exceeded`, naming the limit, before `fm` runs.
   `BRIDGE_APPLE_CONTEXT_TOKENS` changes the limit.
 

@@ -235,6 +235,14 @@ const STRIP_ENV_KEYS = [
 const ALWAYS_STRIP_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
   "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_EXEC_SERVER_URL", "CODEX_URL",
+  // Certificate-authority overrides, and the switch that turns TLS verification off.
+  // Each lets an intercepting proxy present its own certificate for the provider's
+  // host and read every prompt in clear. A proxy that only relays TLS (HTTPS_PROXY)
+  // needs none of them, so it still works. Names from the Codex and Claude Code
+  // binaries and the usual OpenSSL, Node, curl and Python ones.
+  "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE",
+  "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
+  "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
 ];
 
 /** A child's environment: the bridge's own, less the keys above. */
@@ -390,11 +398,15 @@ function codexExtraArgs() {
 // Codex has no single "no tools" switch: its shell, apps, plugins, browser and
 // computer use, image tools, hooks and the rest are each a feature. So before a run
 // the bridge reads `codex features list` (no prompt, nothing sent to a model) and
-// passes `--disable <name>` for EVERY feature it lists, enabled or not, except
-// those below, which change how a request is sent and give the model nothing it can
-// call. "Enabled or not" because the run uses --ignore-user-config, so a feature
-// the user's config turned off can come back on at its default. Features the list
-// marks "removed" are skipped: they no longer do anything.
+// passes `--disable <name>` for EVERY feature it lists, enabled, off or removed,
+// except those below, which change how a request is sent and give the model nothing
+// it can call. "Off" too because the run uses --ignore-user-config, so a feature the
+// user's config turned off can come back on at its default; "removed" too because
+// it costs nothing (a parse-only `--help` check with all of them exits 0) and covers a
+// feature that is only marked removed.
+// The list is read again for EVERY run, never cached: Codex can be upgraded while
+// the bridge runs (a LaunchAgent keeps it up for weeks), and a cached list would
+// leave a new release's tool features on. It is one short process with no prompt.
 // Fail closed: if the list cannot be run or read, Codex is not run at all.
 const CODEX_NO_TOOL_FEATURES = new Set([
   "api_key_model_discovery",
@@ -405,7 +417,6 @@ const CODEX_NO_TOOL_FEATURES = new Set([
   "unbounded_connection_retries",
 ]);
 const CODEX_FEATURES_TIMEOUT_MS = 15_000;
-let codexDisablesCache = null; // a successful read is reused; a failed one is tried again
 
 /** Parse `codex features list` into the names to disable. Throws when it cannot. */
 function codexDisablesFrom(listing) {
@@ -417,14 +428,16 @@ function codexDisablesFrom(listing) {
     rows.push({ name: m[1], stage: m[2], enabled: m[3] === "true" });
   }
   if (!rows.length) throw new Error("the feature list was empty");
-  return rows.filter((r) => r.stage !== "removed" && !CODEX_NO_TOOL_FEATURES.has(r.name)).map((r) => r.name);
+  return rows.filter((r) => !CODEX_NO_TOOL_FEATURES.has(r.name)).map((r) => r.name);
 }
 
 function codexDisables() {
-  if (codexDisablesCache) return Promise.resolve(codexDisablesCache);
   return new Promise((resolve, reject) => {
     const refuse = (why) => reject(new BridgeError(
-      `refusing to run Codex: could not read its feature list to turn its tools off (${why})`,
+      `refusing to run Codex: could not read its feature list to turn its tools off (${why}). ` +
+        "The usual cause is a Codex that is missing from the bridge's PATH or older than the " +
+        "tested 0.162.1, which has `features list`, --ignore-user-config, --ignore-rules and " +
+        "--disable: install or upgrade Codex",
       { code: "CODEX_REFUSED", safeToExpose: true },
     ));
     execFile("codex", ["features", "list"], {
@@ -432,8 +445,7 @@ function codexDisables() {
     }, (error, stdout) => {
       if (error) return refuse(error.code === "ENOENT" ? "codex was not found" : `codex features list failed`);
       try {
-        codexDisablesCache = codexDisablesFrom(stdout);
-        resolve(codexDisablesCache);
+        resolve(codexDisablesFrom(stdout));
       } catch (e) {
         refuse(e.message);
       }
@@ -666,6 +678,19 @@ function foldMessages(messages = []) {
   return { system, prompt };
 }
 
+// For the on-device limit an undercount is the failure that matters (the prompt
+// then overflows inside fm), so ASCII counts at ~4 characters a token and every
+// other character (CJK, emoji, accented letters) as at least one token each.
+function appleTokenEstimate(str) {
+  let ascii = 0;
+  let other = 0;
+  for (const ch of str || "") {
+    if (ch.codePointAt(0) < 128) ascii++;
+    else other++;
+  }
+  return Math.ceil(ascii / 4) + other;
+}
+
 function estimateTokens(str) {
   return Math.max(1, Math.round((str || "").length / 4)); // rough ~4 chars/token fallback
 }
@@ -722,7 +747,7 @@ async function runBackend({ model, system, prompt, webSearch = false }, { signal
   const backend = BACKENDS[backendName];
   if (!backend) throw new Error(`Unknown backend "${backendName}" (claude | codex | apple | command | auto)`);
   if (backendName === "apple") {
-    const tokens = estimateTokens(`${system || ""}${prompt || ""}`);
+    const tokens = appleTokenEstimate(`${system || ""}${prompt || ""}`);
     if (tokens > APPLE_CONTEXT_TOKENS) {
       throw new BridgeError(
         `The prompt is about ${tokens} tokens, more than the on-device model's ${APPLE_CONTEXT_TOKENS} tokens. ` +

@@ -4,9 +4,11 @@
 
 ### Upgrading from 0.3.0
 
-Suggested version: **0.4.0**. The HTTP API is a superset of 0.3.0's (streaming is new,
-nothing a 0.3.0 client sends is now read differently), but some configurations stop the
-bridge at start and Codex no longer reads `~/.codex/config.toml`. Under semver a 0.x minor
+Suggested version: **0.4.0**. The HTTP API is a superset of 0.3.0's (streaming is new),
+with two exceptions a 0.3.0 client could meet: in `auto` mode model `system` now goes to
+Apple's built-in backend, and a model id that starts with `-` is now a 400. Some
+configurations also stop the bridge at start, and Codex no longer reads
+`~/.codex/config.toml`. Under semver a 0.x minor
 is where breaking changes go, and the project still calls itself a development and testing
 bridge, so 1.0.0 would promise a stability it has not claimed yet.
 
@@ -19,7 +21,9 @@ Every change a current user could notice, marked **breaking** (you may need to a
 | `BRIDGE_CODEX_ARGS` / `_JSON` are an allowlist (`--model`/`-m`, `--disable`, `--color`, `-c` for three output settings); `--enable`, `--sandbox`, `--dangerously-*`, `--add-dir`, `--profile`, `--oss`, other `-c` and bare arguments stop a `codex` or `auto` bridge at start | breaking | anyone with such Codex extras | remove the flag; the message names it |
 | Codex runs with `--ignore-user-config`: `config.toml`'s model, effort, profiles, MCP servers and providers no longer apply | breaking | Codex users who relied on `config.toml` for the model or effort | send the model in the request or set `BRIDGE_MODEL`; use an effort suffix such as `gpt-5.5:high` |
 | Codex runs with `--ignore-rules`, web search off unless asked for, and every tool feature disabled, so it cannot run commands, read files, browse or use apps | breaking for a workflow that let Codex use tools; an improvement for everyone else | anyone who expected Codex to act on the machine | none for chat use; a tool-using agent was never what the bridge offered |
-| Codex is refused (503, saying why) when `codex features list` cannot be run or read | breaking where `codex` is missing from the service PATH (it would have failed anyway) | `codex` and `auto` bridges | make `codex features list` work as the bridge's user |
+| Codex needs `features list`, `--ignore-user-config`, `--ignore-rules` and `--disable`; 0.162.1 is the version tested | breaking for an older Codex | anyone on an older Codex, which gets a 503 (no `features list`) or a 502 (an unknown flag) | upgrade Codex |
+| The certificate-authority overrides and TLS switch (`CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NIX_SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`) never reach a child, even with `BRIDGE_KEEP_ENV_KEYS=1` | breaking for corporate CA setups | anyone whose network inspects TLS with its own CA, where the CLIs now fail to connect | run the bridge on a network that does not intercept TLS; a relaying `HTTPS_PROXY` still works |
+| Codex is refused (503, saying why and naming the likely cause) when `codex features list` cannot be run or read | breaking where `codex` is missing from the service PATH (it would have failed anyway) | `codex` and `auto` bridges | make `codex features list` work as the bridge's user |
 | Claude Code runs with `--safe-mode`, `--tools=` and `--no-session-persistence`: no CLAUDE.md, skills, plugins, hooks, MCP servers or tools, and no saved session | breaking for a setup that relied on those; an improvement for everyone else | Claude users whose prompts leaned on their CLAUDE.md or tools | put standing instructions in the system message |
 | `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_EXEC_SERVER_URL` and `CODEX_URL` never reach a child, even with `BRIDGE_KEEP_ENV_KEYS=1` | breaking for anyone routing a CLI through a gateway with these | gateway or proxy setups | none supported; the bridge talks to each CLI's own provider |
 | A request `model` that starts with `-` (or is not a string) is a 400 | improvement (breaking only for a client sending such an id) | none known | send a real model id |
@@ -48,21 +52,25 @@ list (now refused) and with `--model` as a separate token, and two expect
   gets `--ephemeral`, `--sandbox read-only`, `--ignore-user-config` and `--ignore-rules`,
   `-c web_search="disabled"` unless the request opted in to web search (then the top-level
   `--search`, nothing else), and `--disable` for every feature `codex features list` shows
-  except removed ones and six that give the model nothing to call. Codex has no single
-  switch for "no tools", and disabling by rule means a tool feature added by a later
-  Codex release is off too. The list is read once with no prompt; if it cannot be read,
-  Codex is refused. The request's model is joined to `--model=`.
+  (on, off or removed) except six that give the model nothing to call. Codex has no
+  single switch for "no tools", and disabling by rule means a tool feature added by a
+  later Codex release is off too. The list is read with no prompt before every run, so an
+  upgrade while the bridge runs is covered; if it cannot be read, Codex is refused. The request's model is joined to `--model=`.
 - **`BRIDGE_CODEX_ARGS` and `BRIDGE_CODEX_ARGS_JSON` are an allowlist**, checked when a
   `codex` or `auto` bridge starts.
 - **Codex's endpoint is fixed.** `OPENAI_BASE_URL`, `OPENAI_API_BASE`,
   `CODEX_EXEC_SERVER_URL` and `CODEX_URL` are removed from every child's environment,
   like `ANTHROPIC_BASE_URL`.
+- **No CA override reaches a child.** `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NIX_SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` are always removed, so an intercepting
+  proxy cannot present its own certificate and read prompts. **Breaking** for corporate
+  TLS-inspection setups.
 - **Apple's on-device model is a built-in backend.** Model `system` (or
   `BRIDGE_BACKEND=apple`) runs `fm respond --no-stream`, prompt on stdin, system text as
   `-i`, and never `--tool`, `--resume`, `--save-transcript`, `--image` or `--schema`. It
   needs no `BRIDGE_COMMAND`, works in `auto` mode and streams like every backend. A prompt
   estimated above `BRIDGE_APPLE_CONTEXT_TOKENS` (default 4096) is a 400 with code
-  `context_length_exceeded` that names the limit.
+  `context_length_exceeded` that names the limit. Each non-ASCII character counts as at
+  least one token, so a CJK prompt is not undercounted.
 - The `command` backend is documented as unchecked.
 
 ### Added

@@ -65,9 +65,12 @@ exfiltrated through a CLI that echoes its environment, and the CLI stays on its 
 login. `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`,
 `CODEX_EXEC_SERVER_URL` and `CODEX_URL` are removed for every backend, even with
 `BRIDGE_KEEP_ENV_KEYS=1`: left set by another tool or a proxy setup, each would send
-prompts to a host other than the CLI's own provider. Proxy variables (`HTTPS_PROXY` and
-the like) are passed on, since a proxy relays TLS to the provider rather than replacing
-it. The env-file loader imports only allowlisted
+prompts to a host other than the CLI's own provider. The certificate-authority
+overrides and the TLS-verification switch, `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NIX_SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, are removed the same way: any of
+them lets an intercepting proxy present its own certificate for the provider's host and
+read every prompt in clear. Proxy variables (`HTTPS_PROXY` and the like) are still passed
+on, because a proxy that only relays TLS cannot read it; a proxy that needs its own CA
+trusted to work is exactly the case this refuses. The env-file loader imports only allowlisted
 `BRIDGE_*` keys, never other app secrets. Raw backend error messages (which can reveal executable names, paths, and login
 state) are redacted from clients by default and replaced with a correlation id that keys
 the full detail in the server log; messages the bridge itself generates about limits and

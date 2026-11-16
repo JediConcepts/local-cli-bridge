@@ -20,9 +20,19 @@ export const STUB_CLI = path.join(here, "fixtures", "stub-cli.mjs");
  * through to a real CLI installed elsewhere on PATH. `records(name)` returns
  * the parsed record of every run of that CLI so far.
  */
+// Every stub folder made in this process, removed when it exits (node --test runs
+// each test file in its own process, so this is once per file).
+const stubDirs = [];
+process.once("exit", () => {
+  for (const d of stubDirs) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 export function makeStubBin() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stub-bin-"));
   const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stub-records-"));
+  stubDirs.push(dir, recordDir);
   const quote = (s) => `'${s.replaceAll("'", "'\\''")}'`;
   for (const name of ["claude", "codex", "fm"]) {
     const shim = path.join(dir, name);
